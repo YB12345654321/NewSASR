@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=2001, type=int)
+parser.add_argument('--num_epochs', default=1001, type=int)
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -42,10 +42,8 @@ parser.add_argument('--k', default=10, type=int)
 
 # Incremental learning arguments
 parser.add_argument('--incremental', action='store_true', help='Enable incremental learning')
-parser.add_argument('--slice_ratios', nargs='+', type=float, default=[0.5, 0.1, 0.1, 0.1, 0.1, 0.1], 
-                    help='Ratios for user-based time slices')
-parser.add_argument('--min_interactions', default=10, type=int, 
-                    help='Minimum interactions per user for valid data')
+parser.add_argument('--slice_ratios', nargs='+', type=float, default=[0.5, 0.1, 0.1, 0.1, 0.1, 0.1], help='Ratios for user-based time slices')
+parser.add_argument('--min_interactions', default=10, type=int, help='Minimum interactions per user for valid data')
 parser.add_argument('--distill_temp', default=2.0, type=float, help='Temperature for knowledge distillation')
 parser.add_argument('--distill_alpha', default=0.5, type=float, help='Weight for distillation loss')
 parser.add_argument('--replay_ratio', default=0.3, type=float, help='Ratio of experience replay')
@@ -429,23 +427,22 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     # Initialize prompt-based model
     print("\n=== Training Prompt-Based Model on T1 ===")
     prompt_model = PromptBaseSASRec(usernum, itemnum, args).to(device)
-    
     prompt_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=args.lr, betas=(0.9, 0.98))
-    
+
     # Initialize prompt manager
     prompt_manager = PromptManager(prompt_model, args.num_prompts, args.importance_threshold)
-    
+
     # T1 sampler
     t1_sampler = WarpSampler(t1_user_train, usernum, itemnum,
-                           batch_size=args.batch_size, maxlen=args.maxlen,
-                           threshold_user=args.threshold_user,
-                           threshold_item=args.threshold_item,
-                           n_workers=3, device=device)
-    
+                        batch_size=args.batch_size, maxlen=args.maxlen,
+                        threshold_user=args.threshold_user,
+                        threshold_item=args.threshold_item,
+                        n_workers=3, device=device)
+
     # Train on T1
     num_batch = max(len(t1_user_train) // args.batch_size, 1)
     t0 = time.time()
-    
+
     for epoch in range(1, args.num_epochs + 1):
         for step in range(num_batch):
             u, seq, pos, neg = t1_sampler.next_batch()
@@ -467,17 +464,21 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 print(f"[Prompt model epoch {epoch}] No valid test users found for evaluation. Skipping.")
             
             t0 = time.time()
-    
+
     # Close T1 sampler
     t1_sampler.close()
-    
+
+    # Calculate prompt importance based on validation
+    prompt_model.calculate_prompt_importance(t1_user_valid, args, device)
+
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
     print(f"Prompt-based model saved to {os.path.join(output_dir, 'prompt_base_model.pt')}")
-    
+
     # Get items from T1
-    t1_users, t1_items_set = time_data.get_slice_data(0)
-    
+    t1_users, t1_items = time_data.get_slice_data(0)
+    print(f"T1 unique users: {len(t1_users)}, unique items: {len(t1_items)}")
+
     # Update item sets
     prompt_manager.update_item_sets(t1_items, set())
     

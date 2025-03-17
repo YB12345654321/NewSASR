@@ -305,3 +305,194 @@ class PromptBaseSASRec(SASRec):
             self.prompt_bank.prompts.register_hook(
                 lambda grad: hook(grad, keep_mask)
             )
+    def train_with_separate_prompt_phases(self, train_data, valid_data, args, device):
+        """
+        Train the model with separate phases for base model and prompts
+        """
+        # Create samplers and optimizers
+        t1_sampler = WarpSampler(train_data, args.usernum, args.itemnum,
+                            batch_size=args.batch_size, maxlen=args.maxlen,
+                            threshold_user=args.threshold_user,
+                            threshold_item=args.threshold_item,
+                            n_workers=3, device=device)
+        
+        # Phase 1: Train base model with frozen prompts
+        print("=== Phase 1: Training base model with frozen prompts ===")
+        # Freeze prompt parameters
+        for param in self.prompt_bank.parameters():
+            param.requires_grad = False
+            
+        # Create optimizer for non-prompt parameters
+        phase1_optimizer = torch.optim.Adam(
+            [p for n, p in self.named_parameters() if 'prompt_bank' not in n],
+            lr=args.lr, betas=(0.9, 0.98)
+        )
+        
+        # Disable prompt mixing during phase 1
+        original_mix_ratio = self.prompt_mix_ratio
+        self.prompt_mix_ratio = 0.0
+        
+        # Train for half the epochs
+        num_batch = max(len(train_data) // args.batch_size, 1)
+        phase1_epochs = args.num_epochs // 2
+        
+        for epoch in range(1, phase1_epochs + 1):
+            for step in range(num_batch):
+                u, seq, pos, neg = t1_sampler.next_batch()
+                
+                phase1_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase1_optimizer.step()
+                
+            if epoch % args.print_freq == 0:
+                t_test = evaluate(self, [train_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                print(f"[Phase 1 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+        
+        # Phase 2: Train prompts with frozen base model
+        print("=== Phase 2: Training prompts with frozen base model ===")
+        # Freeze non-prompt parameters
+        for name, param in self.named_parameters():
+            if 'prompt_bank' not in name:
+                param.requires_grad = False
+        
+        # Unfreeze prompt parameters
+        for param in self.prompt_bank.parameters():
+            param.requires_grad = True
+        
+        # Restore prompt mixing
+        self.prompt_mix_ratio = original_mix_ratio
+        
+        # Create optimizer for prompt parameters only
+        phase2_optimizer = torch.optim.Adam(
+            self.prompt_bank.parameters(),
+            lr=args.lr, betas=(0.9, 0.98)
+        )
+        
+        # Train for remaining epochs
+        phase2_epochs = args.num_epochs - phase1_epochs
+        
+        for epoch in range(1, phase2_epochs + 1):
+            for step in range(num_batch):
+                u, seq, pos, neg = t1_sampler.next_batch()
+                
+                phase2_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase2_optimizer.step()
+                
+            if epoch % args.print_freq == 0:
+                t_test = evaluate(self, [train_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                print(f"[Phase 2 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+        
+        # Close sampler
+        t1_sampler.close()
+        
+        # Calculate prompt importance
+        self.calculate_prompt_importance(valid_data, args, device)
+        
+    def calculate_prompt_importance(self, valid_data, args, device):
+        """
+        Calculate prompt importance based on validation performance
+        """
+        print("=== Calculating prompt importance ===")
+        self.eval()
+        
+        # First, measure baseline performance
+        baseline_ndcg, _ = evaluate(self, [valid_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+        
+        # Initialize importance scores
+        importance_scores = torch.zeros(self.num_prompts, device=self.dev)
+        
+        # For each prompt, measure performance when it's masked out
+        for i in range(self.num_prompts):
+            with torch.no_grad():
+                # Create temporary copy of prompts
+                original_prompts = self.prompt_bank.prompts.clone()
+                
+                # Zero out the specific prompt
+                self.prompt_bank.prompts[i].zero_()
+                
+                # Evaluate with this prompt disabled
+                masked_ndcg, _ = evaluate(self, [valid_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                
+                # Restore original prompts
+                self.prompt_bank.prompts = nn.Parameter(original_prompts)
+                
+                # Calculate importance (performance drop when prompt is removed)
+                importance_scores[i] = max(0, baseline_ndcg - masked_ndcg)
+        
+        # Normalize importance scores
+        if torch.sum(importance_scores) > 0:
+            self.prompt_importance = importance_scores / torch.sum(importance_scores)
+        else:
+            # If all scores are zero, use uniform importance
+            self.prompt_importance = torch.ones(self.num_prompts, device=self.dev) / self.num_prompts
+        
+        print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
+        
+    def prepare_for_incremental_learning(self):
+        """
+        Prepare for incremental learning by completely freezing all prompts
+        """
+        print("=== Freezing all prompts for incremental learning ===")
+        
+        # Completely freeze the prompt bank
+        for param in self.prompt_bank.parameters():
+            param.requires_grad = False
+        
+        # The rest of the model can still learn
+        for name, param in self.named_parameters():
+            if 'prompt_bank' not in name:
+                param.requires_grad = True
+
+
+    def calculate_prompt_importance(self, validation_data, args, device):
+        """
+        Calculate importance of each prompt based on validation performance
+        """
+        print("=== Calculating prompt importance ===")
+        self.eval()
+        
+        # First get baseline performance
+        with torch.no_grad():
+            baseline_ndcg, _ = evaluate(self, [validation_data, {}, {}, self.usernum, self.itemnum], args, device)
+        
+        # Measure performance drop when each prompt is disabled
+        importance = torch.zeros(self.num_prompts, device=self.dev)
+        for i in range(self.num_prompts):
+            with torch.no_grad():
+                # Store original prompt
+                original_prompt = self.prompt_bank.prompts[i].clone()
+                
+                # Temporarily zero out this prompt
+                self.prompt_bank.prompts[i].fill_(0)
+                
+                # Check performance without this prompt
+                masked_ndcg, _ = evaluate(self, [validation_data, {}, {}, self.usernum, self.itemnum], args, device)
+                
+                # Restore original prompt
+                self.prompt_bank.prompts[i].copy_(original_prompt)
+                
+                # Higher performance drop means higher importance
+                importance[i] = max(0, baseline_ndcg - masked_ndcg)
+        
+        # Normalize importance
+        if torch.sum(importance) > 0:
+            self.prompt_importance = importance / torch.sum(importance)
+        else:
+            # If all zeros, use uniform importance
+            self.prompt_importance = torch.ones(self.num_prompts, device=self.dev) / self.num_prompts
+        
+        print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
+        return self.prompt_importance
+
+    def freeze_prompts_for_incremental(self):
+        """
+        Completely freeze all prompts for incremental learning
+        """
+        print("=== Freezing all prompts for incremental learning ===")
+        
+        # Completely freeze the prompt bank
+        for param in self.prompt_bank.parameters():
+            param.requires_grad = False

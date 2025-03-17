@@ -30,23 +30,19 @@ class PromptManager:
         self.new_items = set(new_items)
         self.prompt_model.update_item_sets(old_items, new_items)
         
+
     def prepare_for_training(self, current_slice):
         """
         Prepare prompts for training on a new time slice
-        
-        Args:
-            current_slice: Index of the current time slice
         """
-        # Normalize prompt importance
-        prompt_importance = self.prompt_model.prompt_importance
-        if torch.sum(prompt_importance) > 0:
-            normalized_importance = prompt_importance / torch.sum(prompt_importance)
+        # When starting incremental learning, freeze all prompts
+        if current_slice == 1:
+            self.prompt_model.freeze_prompts_for_incremental()
             
-            # Freeze important prompts to prevent catastrophic forgetting
-            if current_slice > 1:  # Only start freezing after first incremental update
-                self.prompt_model.freeze_important_prompts(self.importance_threshold)
-                
-            print(f"Prompt importance: {normalized_importance.cpu().numpy()}")
+        # Print prompt importance for reference
+        print(f"Prompt importance: {self.prompt_model.prompt_importance.cpu().numpy()}")
+
+
             
     def reset_prompt_stats(self):
         """
