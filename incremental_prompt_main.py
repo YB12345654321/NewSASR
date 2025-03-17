@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=10, type=int)
+parser.add_argument('--num_epochs', default=2001, type=int)
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -55,10 +55,10 @@ parser.add_argument('--load_splits', default=None, type=str, help='Path to load 
 parser.add_argument('--save_splits', action='store_true', help='Whether to save data splits for future use')
 
 # Prompt-based arguments
-parser.add_argument('--prompt_model', action='store_true', help='Use prompt-based model')
 parser.add_argument('--num_prompts', default=8, type=int, help='Number of prompts in the bank')
 parser.add_argument('--prompt_mix_ratio', default=0.3, type=float, help='Mixing ratio for prompts')
 parser.add_argument('--importance_threshold', default=0.7, type=float, help='Threshold for prompt importance')
+parser.add_argument('--run_both', action='store_true', help='Run both regular incremental and prompt-based models')
 
 def set_seed(seed):
     """
@@ -86,26 +86,18 @@ def check_dataset_validity(dataset):
             valid_test_users.append(u)
     return len(valid_test_users) > 0
 
-def run_prompt_incremental_learning(args):
+def prepare_time_sliced_data(args, output_dir):
     """
-    Run incremental learning experiment with prompt-based mechanism
+    Load or create time-sliced data
+    
+    Args:
+        args: Command line arguments
+        output_dir: Output directory for saving data
+        
+    Returns:
+        TimeSlicedData object and list of time slices
     """
-    # Set random seed for reproducibility
-    set_seed(args.seed)
-    
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    
-    # Create output directory
-    output_dir = args.dataset + '_' + args.train_dir + '_prompt_incremental'
-    if not os.path.isdir(output_dir):
-        os.makedirs(output_dir)
-    
-    # Log file
-    log_file = open(os.path.join(output_dir, 'prompt_incremental_log.txt'), 'w')
-    log_file.write(f"Random seed: {args.seed}\n")
-    
-    # Load time-sliced data
+    # Set number of slices from slice ratios
     args.num_slices = len(args.slice_ratios)
     
     # Check if we should load pre-saved data splits
@@ -158,6 +150,24 @@ def run_prompt_incremental_learning(args):
     print(f"Total users: {len(time_data.all_users)}, Valid users: {len(time_data.valid_users)}")
     print(f"Total items: {time_data.itemnum}")
     
+    return time_data, time_slices
+
+def run_incremental_learning(args, time_data, output_dir, log_file):
+    """
+    Run incremental learning experiment with knowledge distillation
+    
+    Args:
+        args: Command line arguments
+        time_data: TimeSlicedData object
+        output_dir: Output directory for saving results
+        log_file: Log file object
+        
+    Returns:
+        Dictionary of results
+    """
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    
     # Prepare T1 (first slice)
     t1_data = time_data.prepare_slice(0, include_previous=False)
     [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum] = t1_data
@@ -169,9 +179,257 @@ def run_prompt_incremental_learning(args):
         cc += len(t1_user_train[u])
     print(f"Average sequence length: {cc / len(t1_user_train) if len(t1_user_train) > 0 else 0}")
     
+    # Initialize base model
+    print("\n=== Training Base Model on T1 ===")
+    base_model = SASRec(usernum, itemnum, args).to(device)
+    base_optimizer = torch.optim.Adam(base_model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    
+    # T1 sampler
+    t1_sampler = WarpSampler(t1_user_train, usernum, itemnum,
+                           batch_size=args.batch_size, maxlen=args.maxlen,
+                           threshold_user=args.threshold_user,
+                           threshold_item=args.threshold_item,
+                           n_workers=3, device=device)
+    
+    # Train on T1
+    num_batch = max(len(t1_user_train) // args.batch_size, 1)
+    t0 = time.time()
+    
+    for epoch in range(1, args.num_epochs + 1):
+        for step in range(num_batch):
+            u, seq, pos, neg = t1_sampler.next_batch()
+            
+            base_optimizer.zero_grad()
+            loss, attention_weights, auc, l2_loss = base_model(u, seq, pos, neg, is_training=True)
+            loss.backward()
+            base_optimizer.step()
+            
+        if epoch % args.print_freq == 0:
+            t1 = time.time() - t0
+            
+            if check_dataset_validity(t1_data):
+                t_test = evaluate(base_model, t1_data, args, device)
+                log_file.write(f"Base model epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
+                log_file.flush()
+                print(f"[Base model epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
+            else:
+                print(f"[Base model epoch {epoch}] No valid test users found for evaluation. Skipping.")
+            
+            t0 = time.time()
+    
+    # Close T1 sampler
+    t1_sampler.close()
+    
+    # Save base model
+    torch.save(base_model, os.path.join(output_dir, 'base_model.pt'))
+    print(f"Base model saved to {os.path.join(output_dir, 'base_model.pt')}")
+    
+    # Get items from T1
+    t1_users, t1_items = time_data.get_slice_data(0)
+    print(f"T1 unique users: {len(t1_users)}, unique items: {len(t1_items)}")
+    
+    # Initialize incremental model from base model
+    print("\n=== Initializing Incremental Model ===")
+    incremental_model = IncrementalSASRec(usernum, itemnum, args).to(device)
+    
+    # Copy weights from base model
+    incremental_model.load_state_dict(base_model.state_dict())
+    
+    # Create replay buffer
+    replay_buffer = ExperienceReplay(args.buffer_size, args.replay_ratio)
+    
+    # Create dataloader for T1 buffer
+    t1_buffer = time_data.create_replay_buffer(0, args.buffer_size, max_seq_length=1)
+    replay_buffer.update_buffer(t1_buffer)
+    
+    # Results storage
+    results = {
+        'base_model': {},
+        'incremental_model': {}
+    }
+    
+    # Evaluate base model on all slices
+    print("\n=== Evaluating Base Model on All Slices ===")
+    for i in range(args.num_slices):
+        slice_data = time_data.prepare_slice(i, include_previous=False)
+        if check_dataset_validity(slice_data):
+            ndcg, hr = evaluate(base_model, slice_data, args, device)
+            results['base_model'][f'slice_{i}'] = {'ndcg': ndcg, 'hr': hr}
+            print(f"Base model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}")
+            log_file.write(f"Base model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}\n")
+        else:
+            results['base_model'][f'slice_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
+            print(f"Base model on slice {i}: No valid test users found. Skipping.")
+    
+    # Incremental learning on subsequent slices
+    for slice_idx in range(1, args.num_slices):
+        print(f"\n=== Incremental Learning on Slice {slice_idx} ===")
+        
+        # Get slice data
+        slice_data = time_data.prepare_slice(slice_idx, include_previous=False)
+        [slice_user_train, slice_user_valid, slice_user_test, _, _] = slice_data
+        
+        # Get slice items
+        slice_users, slice_items = time_data.get_slice_data(slice_idx)
+        print(f"Slice {slice_idx} unique users: {len(slice_users)}, unique items: {len(slice_items)}")
+        
+        # Update item sets for tracking
+        incremental_model.update_item_sets(t1_items, slice_items)
+        
+        # Create sampler for this slice
+        slice_sampler = WarpSampler(slice_user_train, usernum, itemnum,
+                                  batch_size=args.batch_size, maxlen=args.maxlen,
+                                  threshold_user=args.threshold_user,
+                                  threshold_item=args.threshold_item,
+                                  n_workers=3, device=device)
+        
+        # Create optimizer with lower learning rate
+        inc_lr = args.lr * 0.1  # Lower learning rate for stability
+        inc_optimizer = torch.optim.Adam(incremental_model.parameters(), lr=inc_lr, betas=(0.9, 0.98))
+        
+        # Create new replay buffer for this slice
+        slice_buffer = time_data.create_replay_buffer(slice_idx, args.buffer_size, max_seq_length=1)
+        replay_buffer.update_buffer(slice_buffer)
+        
+        # Train for fewer epochs
+        inc_epochs = args.num_epochs //4  # Fewer epochs for incremental learning
+        t0 = time.time()
+
+        for epoch in range(1, inc_epochs + 1):
+            # Determine number of batches
+            num_batch = max(len(slice_user_train) // args.batch_size, 1)
+            
+            for step in range(num_batch):
+                # Get batch from current slice
+                u, seq, pos, neg = slice_sampler.next_batch()
+                
+                # Optionally mix with replay samples
+                if random.random() < args.replay_ratio and replay_buffer.buffer:
+                    replay_batch = replay_buffer.sample_batch(args.batch_size)
+                    if replay_batch:
+                        r_users, r_seqs, r_poss, r_negs = replay_batch
+                        
+                        # Convert all to numpy arrays first
+                        r_users_array = np.array(r_users)
+                        r_poss_array = np.array(r_poss)
+                        r_negs_array = np.array(r_negs)
+                        
+                        # Pad sequences properly
+                        padded_seqs = np.zeros((len(r_seqs), args.maxlen), dtype=np.int64)
+                        for i, seq_item in enumerate(r_seqs):
+                            # Make sure we handle it as a sequence
+                            if not isinstance(seq_item, (list, np.ndarray)):
+                                seq_item = [seq_item]
+                            
+                            # Place at the end of the padded sequence
+                            seq_length = min(len(seq_item), args.maxlen)
+                            if seq_length > 0:
+                                padded_seqs[i, args.maxlen - seq_length:] = np.array(seq_item[-seq_length:])
+                        
+                        # Get the shapes of the original tensors for proper reshaping
+                        u_shape = u.shape
+                        seq_shape = seq.shape
+                        pos_shape = pos.shape
+                        neg_shape = neg.shape
+                        
+                        # Convert to tensors, ensuring they have the right dtype and shape
+                        r_users_tensor = torch.tensor(r_users_array, dtype=torch.long, device=device)
+                        r_seqs_tensor = torch.tensor(padded_seqs, dtype=torch.long, device=device)
+                        
+                        # Reshape pos and neg to match the original tensors
+                        if len(pos_shape) > 1:  # If pos is 2D
+                            # Reshape to match (batch_size, maxlen) if that's the shape
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            
+                            # Expand to match maxlen if needed
+                            if pos_shape[1] > 1:
+                                r_poss_tensor = r_poss_tensor.expand(-1, pos_shape[1])
+                                r_negs_tensor = r_negs_tensor.expand(-1, neg_shape[1])
+                        else:
+                            # If pos is 1D, keep it 1D
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device)
+                        
+                        # Combine current and replay
+                        u = torch.cat([u, r_users_tensor])
+                        seq = torch.cat([seq, r_seqs_tensor])
+                        pos = torch.cat([pos, r_poss_tensor])
+                        neg = torch.cat([neg, r_negs_tensor])
+                
+                # Update model with knowledge distillation
+                inc_optimizer.zero_grad()
+                loss, _, auc, _ = incremental_model(u, seq, pos, neg, is_training=True, base_model=base_model)
+                loss.backward()
+                inc_optimizer.step()
+            
+            if epoch % (args.print_freq // 2) == 0:
+                t1 = time.time() - t0
+                
+                # Evaluate on current slice
+                if check_dataset_validity(slice_data):
+                    t_test = evaluate(incremental_model, slice_data, args, device)
+                    log_file.write(f"Slice {slice_idx}, epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
+                    log_file.flush()
+                    print(f"[Slice {slice_idx}, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
+                else:
+                    print(f"[Slice {slice_idx}, epoch {epoch}] No valid test users found. Skipping.")
+                
+                t0 = time.time()
+        
+        # Close sampler
+        slice_sampler.close()
+        
+        # Save incremental model
+        torch.save(incremental_model, os.path.join(output_dir, f'incremental_model_slice_{slice_idx}.pt'))
+        
+        # Evaluate incremental model on all slices
+        print(f"\n=== Evaluating Incremental Model After Slice {slice_idx} ===")
+        for i in range(args.num_slices):
+            eval_data = time_data.prepare_slice(i, include_previous=False)
+            if check_dataset_validity(eval_data):
+                ndcg, hr = evaluate(incremental_model, eval_data, args, device)
+                results['incremental_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': ndcg, 'hr': hr}
+                print(f"Incremental model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}")
+                log_file.write(f"Incremental model (after slice {slice_idx}) on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}\n")
+            else:
+                results['incremental_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
+                print(f"Incremental model on slice {i}: No valid test users found. Skipping.")
+    
+    # Save final results
+    with open(os.path.join(output_dir, 'results_incremental.pkl'), 'wb') as f:
+        pickle.dump(results, f)
+    
+    print("\n=== Incremental Learning Experiment Completed ===")
+    
+    return results, base_model, t1_items
+
+def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
+    """
+    Run prompt-based incremental learning experiment
+    
+    Args:
+        args: Command line arguments
+        time_data: TimeSlicedData object
+        base_model: Base model trained on T1
+        t1_items: Items from T1
+        output_dir: Output directory for saving results
+        log_file: Log file object
+        
+    Returns:
+        Dictionary of results
+    """
+    # Set device
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    
+    # Prepare T1 (first slice)
+    t1_data = time_data.prepare_slice(0, include_previous=False)
+    [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum] = t1_data
+    
     # Initialize prompt-based model
     print("\n=== Training Prompt-Based Model on T1 ===")
     prompt_model = PromptBaseSASRec(usernum, itemnum, args).to(device)
+    
     prompt_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=args.lr, betas=(0.9, 0.98))
     
     # Initialize prompt manager
@@ -218,8 +476,7 @@ def run_prompt_incremental_learning(args):
     print(f"Prompt-based model saved to {os.path.join(output_dir, 'prompt_base_model.pt')}")
     
     # Get items from T1
-    t1_users, t1_items = time_data.get_slice_data(0)
-    print(f"T1 unique users: {len(t1_users)}, unique items: {len(t1_items)}")
+    t1_users, t1_items_set = time_data.get_slice_data(0)
     
     # Update item sets
     prompt_manager.update_item_sets(t1_items, set())
@@ -399,30 +656,164 @@ def run_prompt_incremental_learning(args):
                 print(f"Prompt model on slice {i}: No valid test users found. Skipping.")
     
     # Save final results
-    with open(os.path.join(output_dir, 'prompt_results.pkl'), 'wb') as f:
+    with open(os.path.join(output_dir, 'results_prompt.pkl'), 'wb') as f:
         pickle.dump(results, f)
+    
+    print("\n=== Prompt-Based Incremental Learning Experiment Completed ===")
+    
+    return results
+
+def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
+    """
+    Compare results from both models
+    
+    Args:
+        results_incremental: Results from incremental model
+        results_prompt: Results from prompt-based model
+        args: Command line arguments
+        output_dir: Output directory
+        log_file: Log file object
+    """
+    print("\n=== Comparing Incremental and Prompt-Based Models ===")
+    log_file.write("\n=== Comparison Results ===\n")
+    
+    # Find the maximum slice index for which we have results
+    max_slice = max([int(k.split('_')[2]) for k in results_incremental['incremental_model'].keys() 
+                   if k.startswith('after_slice_')])
+    
+    # Compare performance on each slice after training on final slice
+    comparison_table = "Slice\tBase NDCG\tBase HR\tIncremental NDCG\tIncremental HR\tPrompt NDCG\tPrompt HR\tNDCG Diff\tHR Diff\n"
+    comparison_table += "-" * 100 + "\n"
+    
+    avg_inc_ndcg = 0.0
+    avg_prompt_ndcg = 0.0
+    avg_inc_hr = 0.0
+    avg_prompt_hr = 0.0
+    
+    for i in range(args.num_slices):
+        base_ndcg = results_incremental['base_model'][f'slice_{i}']['ndcg']
+        base_hr = results_incremental['base_model'][f'slice_{i}']['hr']
+        
+        inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{i}']['ndcg']
+        inc_hr = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{i}']['hr']
+        
+        prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{i}']['ndcg']
+        prompt_hr = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{i}']['hr']
+        
+        # Calculate differences
+        ndcg_diff = prompt_ndcg - inc_ndcg
+        hr_diff = prompt_hr - inc_hr
+        
+        # Add to running averages
+        avg_inc_ndcg += inc_ndcg
+        avg_prompt_ndcg += prompt_ndcg
+        avg_inc_hr += inc_hr
+        avg_prompt_hr += prompt_hr
+        
+        # Add row to table
+        comparison_table += f"T{i+1}\t{base_ndcg:.4f}\t{base_hr:.4f}\t{inc_ndcg:.4f}\t{inc_hr:.4f}\t{prompt_ndcg:.4f}\t{prompt_hr:.4f}\t{ndcg_diff:+.4f}\t{hr_diff:+.4f}\n"
+    
+    # Calculate averages
+    avg_inc_ndcg /= args.num_slices
+    avg_prompt_ndcg /= args.num_slices
+    avg_inc_hr /= args.num_slices
+    avg_prompt_hr /= args.num_slices
+    
+    # Add averages to table
+    comparison_table += "-" * 100 + "\n"
+    comparison_table += f"Avg\t-\t-\t{avg_inc_ndcg:.4f}\t{avg_inc_hr:.4f}\t{avg_prompt_ndcg:.4f}\t{avg_prompt_hr:.4f}\t{avg_prompt_ndcg-avg_inc_ndcg:+.4f}\t{avg_prompt_hr-avg_inc_hr:+.4f}\n"
+    
+    # Add performance on first slice (knowledge retention)
+    t1_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_0']['ndcg']
+    t1_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_0']['ndcg']
+    t1_base_ndcg = results_incremental['base_model']['slice_0']['ndcg']
+    
+    t1_inc_retention = t1_inc_ndcg / t1_base_ndcg if t1_base_ndcg > 0 else 0
+    t1_prompt_retention = t1_prompt_ndcg / t1_base_ndcg if t1_base_ndcg > 0 else 0
+    
+    comparison_table += "\n=== Knowledge Retention (T1 Performance) ===\n"
+    comparison_table += f"Incremental Model Retention: {t1_inc_retention:.2%}\n"
+    comparison_table += f"Prompt Model Retention: {t1_prompt_retention:.2%}\n"
+    comparison_table += f"Retention Improvement: {t1_prompt_retention - t1_inc_retention:+.2%}\n"
+    
+    # Add performance on latest slice (new knowledge acquisition)
+    latest_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{max_slice}']['ndcg']
+    latest_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{max_slice}']['ndcg']
+    latest_base_ndcg = results_incremental['base_model'][f'slice_{max_slice}']['ndcg']
+    
+    comparison_table += f"\n=== New Knowledge Acquisition (T{max_slice+1} Performance) ===\n"
+    comparison_table += f"Incremental Model NDCG: {latest_inc_ndcg:.4f}\n"
+    comparison_table += f"Prompt Model NDCG: {latest_prompt_ndcg:.4f}\n"
+    comparison_table += f"Improvement: {latest_prompt_ndcg - latest_inc_ndcg:+.4f}\n"
+    
+    # Print and log comparison table
+    print(comparison_table)
+    log_file.write(comparison_table)
+    
+    # Save comparison to file
+    with open(os.path.join(output_dir, 'comparison_results.txt'), 'w') as f:
+        f.write(comparison_table)
+    
+    # Combine results for easy reference
+    combined_results = {
+        'base_model': results_incremental['base_model'],
+        'incremental_model': results_incremental['incremental_model'],
+        'prompt_model': results_prompt['prompt_model']
+    }
+    
+    with open(os.path.join(output_dir, 'combined_results.pkl'), 'wb') as f:
+        pickle.dump(combined_results, f)
+    
+    print(f"Comparison saved to {os.path.join(output_dir, 'comparison_results.txt')}")
+
+def run_comparison(args):
+    """
+    Run both incremental and prompt-based models and compare results
+    """
+    # Set random seed for reproducibility
+    set_seed(args.seed)
+    
+    # Create output directory
+    output_dir = args.dataset + '_' + args.train_dir + '_comparison'
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    
+    # Log file
+    log_file = open(os.path.join(output_dir, 'comparison_log.txt'), 'w')
+    log_file.write(f"Random seed: {args.seed}\n")
+    
+    # Load time sliced data
+    time_data, time_slices = prepare_time_sliced_data(args, output_dir)
+    
+    # Run incremental learning
+    print("\n=== Running Standard Incremental Learning ===")
+    results_incremental, base_model, t1_items = run_incremental_learning(args, time_data, output_dir, log_file)
+    
+    # Run prompt-based incremental learning
+    print("\n=== Running Prompt-Based Incremental Learning ===")
+    results_prompt = run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file)
+    
+    # Compare results
+    compare_results(results_incremental, results_prompt, args, output_dir, log_file)
     
     # Close log file
     log_file.close()
     
-    print("\n=== Prompt-Based Incremental Learning Experiment Completed ===")
+    print("\n=== Comparison Completed ===")
     print(f"Results saved to {output_dir}")
-    
-    return results
 
 def main():
     args = parser.parse_args()
     
+    # Default to running both models for comparison
+    args.run_both = True
+    
     # Set random seed for reproducibility
     set_seed(args.seed)
     
-    # Run prompt-based incremental learning when specified
-    if args.incremental and args.prompt_model:
-        run_prompt_incremental_learning(args)
-    elif args.incremental:
-        # Use the original incremental learning code from main.py
-        from main import run_incremental_learning
-        run_incremental_learning(args)
+    if args.incremental and args.run_both:
+        # Run both models and compare
+        run_comparison(args)
     else:
         # Original training code
         if not os.path.isdir(args.dataset + '_' + args.train_dir):
