@@ -5,10 +5,6 @@ import torch
 import copy
 from sampler import WarpSampler
 
-
-
-# Replace the TimeSlicedData class with this implementation:
-
 class TimeSlicedData:
     """
     Manager for chronologically sliced user interaction data
@@ -51,34 +47,33 @@ class TimeSlicedData:
         for user in self.user_interactions:
             self.user_interactions[user].sort(key=lambda x: x[1])
         
+        # Print minimum interactions required for each slice
+        min_per_slice = [max(3, int(self.min_interactions * ratio / 0.1)) for ratio in self.slice_ratios]
+        print(f"Using slice ratios: {self.slice_ratios}")
+        print(f"Minimum interactions per slice: {min_per_slice}")
+        
         # Filter out users with insufficient interactions
         for user, interactions in self.user_interactions.items():
             total_interactions = len(interactions)
             
-            # Improved validation check for variable slice ratios
-            # Calculate minimum total interactions based on minimum per slice
-            min_total_required = 0
-            for ratio in self.slice_ratios:
-                # Each slice needs at least the minimum interactions
-                # But scale down requirement for smaller slices
+            # Check if each slice would have enough interactions
+            is_valid = True
+            for i, ratio in enumerate(self.slice_ratios):
+                # Calculate minimum required for this slice
                 adjusted_min = max(3, int(self.min_interactions * ratio / 0.1))
+                
+                # Calculate expected interactions in this slice
                 slice_interactions = int(total_interactions * ratio)
                 
+                # Check if this slice has enough interactions
                 if slice_interactions < adjusted_min:
+                    is_valid = False
                     break
-                
-                min_total_required += adjusted_min
             
-            # Check if user has enough total interactions
-            if total_interactions >= min_total_required:
+            if is_valid:
                 self.valid_users.add(user)
         
         print(f"Total users: {len(self.user_interactions)}, Valid users: {len(self.valid_users)}")
-        print(f"Using slice ratios: {self.slice_ratios}")
-        
-        # Print minimum interactions required for each slice
-        min_per_slice = [max(3, int(self.min_interactions * ratio / 0.1)) for ratio in self.slice_ratios]
-        print(f"Minimum interactions per slice: {min_per_slice}")
         
         # Split each valid user's interactions into slices
         for user in self.valid_users:
@@ -114,7 +109,6 @@ class TimeSlicedData:
             print(f"Slice {i}: {len(self.time_slices[i])} interactions, {len(slice_users)} users")
             
         return self.time_slices
-
 
     def get_slice_data(self, slice_idx):
         """
