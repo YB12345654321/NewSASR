@@ -55,18 +55,30 @@ class TimeSlicedData:
         for user, interactions in self.user_interactions.items():
             total_interactions = len(interactions)
             
-            # Check if each slice would have enough interactions
-            is_valid = True
+            # Improved validation check for variable slice ratios
+            # Calculate minimum total interactions based on minimum per slice
+            min_total_required = 0
             for ratio in self.slice_ratios:
+                # Each slice needs at least the minimum interactions
+                # But scale down requirement for smaller slices
+                adjusted_min = max(3, int(self.min_interactions * ratio / 0.1))
                 slice_interactions = int(total_interactions * ratio)
-                if slice_interactions < self.min_interactions:
-                    is_valid = False
+                
+                if slice_interactions < adjusted_min:
                     break
+                
+                min_total_required += adjusted_min
             
-            if is_valid:
+            # Check if user has enough total interactions
+            if total_interactions >= min_total_required:
                 self.valid_users.add(user)
         
         print(f"Total users: {len(self.user_interactions)}, Valid users: {len(self.valid_users)}")
+        print(f"Using slice ratios: {self.slice_ratios}")
+        
+        # Print minimum interactions required for each slice
+        min_per_slice = [max(3, int(self.min_interactions * ratio / 0.1)) for ratio in self.slice_ratios]
+        print(f"Minimum interactions per slice: {min_per_slice}")
         
         # Split each valid user's interactions into slices
         for user in self.valid_users:
@@ -102,7 +114,6 @@ class TimeSlicedData:
             print(f"Slice {i}: {len(self.time_slices[i])} interactions, {len(slice_users)} users")
             
         return self.time_slices
-
 
 
     def get_slice_data(self, slice_idx):
