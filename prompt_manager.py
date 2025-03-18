@@ -34,14 +34,34 @@ class PromptManager:
     def prepare_for_training(self, current_slice):
         """
         Prepare prompts for training on a new time slice
+        
+        Args:
+            current_slice: Index of the current time slice
         """
-        # When starting incremental learning, freeze all prompts
-        if current_slice == 1:
-            self.prompt_model.freeze_prompts_for_incremental()
+        # Normalize prompt importance
+        prompt_importance = self.prompt_model.prompt_importance
+        if torch.sum(prompt_importance) > 0:
+            normalized_importance = prompt_importance / torch.sum(prompt_importance)
             
-        # Print prompt importance for reference
-        print(f"Prompt importance: {self.prompt_model.prompt_importance.cpu().numpy()}")
-
+            # Freeze important prompts to prevent catastrophic forgetting
+            if current_slice > 1:  # Only start freezing after first incremental update
+                for param in self.prompt_model.prompt_bank.parameters():
+                    param.requires_grad = True  # Reset all parameters to trainable
+                    
+                # Register gradient hook for selective updating
+                def grad_hook(grad):
+                    # Create mask based on importance threshold
+                    mask = normalized_importance > self.importance_threshold
+                    mask = mask.to(grad.device)
+                    # Zero out gradients for important prompts (freeze them)
+                    mask_expanded = mask.unsqueeze(1).expand_as(grad)
+                    return grad * (~mask_expanded)
+                
+                # Apply the hook
+                self.prompt_model.prompt_bank.prompts.register_hook(grad_hook)
+                
+            print(f"Prompt importance: {normalized_importance.cpu().numpy()}")
+            print(f"Freezing prompts with importance > {self.importance_threshold}")
 
             
     def reset_prompt_stats(self):
