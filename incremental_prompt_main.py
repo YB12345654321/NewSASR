@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=1001, type=int)
+parser.add_argument('--num_epochs', default=401, type=int)
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -361,7 +361,7 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
                 loss.backward()
                 inc_optimizer.step()
             
-            if epoch % (args.print_freq // 2) == 0:
+            if epoch % args.print_freq == 0:
                 t1 = time.time() - t0
                 
                 # Evaluate on current slice
@@ -546,7 +546,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         replay_buffer.update_buffer(slice_buffer)
         
         # Train for fewer epochs
-        inc_epochs = args.num_epochs // 2  # Fewer epochs for incremental learning
+        inc_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
         t0 = time.time()
 
         for epoch in range(1, inc_epochs + 1):
@@ -618,7 +618,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 loss.backward()
                 inc_optimizer.step()
             
-            if epoch % (args.print_freq // 2) == 0:
+            if epoch % args.print_freq  == 0:
                 t1 = time.time() - t0
                 
                 # Evaluate on current slice
