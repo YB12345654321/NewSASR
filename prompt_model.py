@@ -393,45 +393,47 @@ class PromptBaseSASRec(SASRec):
         # Calculate prompt importance
         self.calculate_prompt_importance(valid_data, args, device)
         
-    def calculate_prompt_importance(self, valid_data, args, device):
+    def calculate_prompt_importance(self, validation_data, args, device):
         """
-        Calculate prompt importance based on validation performance
+        Calculate importance of each prompt based on validation performance
         """
         print("=== Calculating prompt importance ===")
         self.eval()
+
+        eval_dataset = [validation_data, {}, validation_data, self.usernum, self.itemnum]
         
-        # First, measure baseline performance
-        baseline_ndcg, _ = evaluate(self, [valid_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+        # First get baseline performance with all prompts
+        with torch.no_grad():
+            baseline_ndcg, _ = evaluate(self, eval_dataset, args, device)
         
-        # Initialize importance scores
-        importance_scores = torch.zeros(self.num_prompts, device=self.dev)
+        # Store original prompt weights
+        original_prompts = self.prompt_bank.prompts.clone()
         
-        # For each prompt, measure performance when it's masked out
+        # Measure performance drop when each prompt is disabled
+        importance = torch.zeros(self.num_prompts, device=self.dev)
         for i in range(self.num_prompts):
             with torch.no_grad():
-                # Create temporary copy of prompts
-                original_prompts = self.prompt_bank.prompts.clone()
+                # Temporarily zero out this prompt
+                self.prompt_bank.prompts[i] = torch.zeros_like(self.prompt_bank.prompts[i])
                 
-                # Zero out the specific prompt
-                self.prompt_bank.prompts[i].zero_()
+                # Check performance without this prompt
+                masked_ndcg, _ = evaluate(self, eval_dataset, args, device)
                 
-                # Evaluate with this prompt disabled
-                masked_ndcg, _ = evaluate(self, [valid_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                # Higher performance drop means higher importance
+                importance[i] = max(0, baseline_ndcg - masked_ndcg)
                 
-                # Restore original prompts
-                self.prompt_bank.prompts = nn.Parameter(original_prompts)
-                
-                # Calculate importance (performance drop when prompt is removed)
-                importance_scores[i] = max(0, baseline_ndcg - masked_ndcg)
+                # Restore this prompt
+                self.prompt_bank.prompts[i] = original_prompts[i].clone()
         
-        # Normalize importance scores
-        if torch.sum(importance_scores) > 0:
-            self.prompt_importance = importance_scores / torch.sum(importance_scores)
+        # Normalize importance (add small epsilon to avoid division by zero)
+        if torch.sum(importance) > 1e-6:
+            self.prompt_importance = importance / torch.sum(importance)
         else:
-            # If all scores are zero, use uniform importance
-            self.prompt_importance = torch.ones(self.num_prompts, device=self.dev) / self.num_prompts
+            # If all zeros, use slightly randomized importance to break ties
+            self.prompt_importance = torch.softmax(torch.randn(self.num_prompts, device=self.dev) * 0.1, dim=0)
         
         print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
+        return self.prompt_importance
         
     def prepare_for_incremental_learning(self):
         """
@@ -448,7 +450,6 @@ class PromptBaseSASRec(SASRec):
             if 'prompt_bank' not in name:
                 param.requires_grad = True
 
-
     def calculate_prompt_importance(self, validation_data, args, device):
         """
         Calculate importance of each prompt based on validation performance
@@ -456,9 +457,15 @@ class PromptBaseSASRec(SASRec):
         print("=== Calculating prompt importance ===")
         self.eval()
         
+        # In your implementation, t1_data contains [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum]
+        # So we need to create a proper dataset format using the validation data
+        # First, build a dataset in the right format for evaluate()
+        dataset = [validation_data, validation_data, validation_data, self.usernum, self.itemnum]
+        
         # First get baseline performance with all prompts
         with torch.no_grad():
-            baseline_ndcg, _ = evaluate(self, validation_data, args, device)
+            baseline_ndcg, _ = evaluate(self, dataset, args, device)
+        print(f"Baseline NDCG: {baseline_ndcg:.4f}")
         
         # Store original prompt weights
         original_prompts = self.prompt_bank.prompts.clone()
@@ -471,7 +478,8 @@ class PromptBaseSASRec(SASRec):
                 self.prompt_bank.prompts[i] = torch.zeros_like(self.prompt_bank.prompts[i])
                 
                 # Check performance without this prompt
-                masked_ndcg, _ = evaluate(self, validation_data, args, device)
+                masked_ndcg, _ = evaluate(self, dataset, args, device)
+                print(f"Prompt {i} disabled - NDCG: {masked_ndcg:.4f}, Drop: {baseline_ndcg - masked_ndcg:.4f}")
                 
                 # Higher performance drop means higher importance
                 importance[i] = max(0, baseline_ndcg - masked_ndcg)
@@ -484,7 +492,7 @@ class PromptBaseSASRec(SASRec):
             self.prompt_importance = importance / torch.sum(importance)
         else:
             # If all zeros, use slightly randomized importance to break ties
-            self.prompt_importance = torch.softmax(torch.randn(self.num_prompts, device=self.dev) * 0.1, dim=-0)
+            self.prompt_importance = torch.softmax(torch.randn(self.num_prompts, device=self.dev) * 0.1, dim=0)
         
         print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
         return self.prompt_importance

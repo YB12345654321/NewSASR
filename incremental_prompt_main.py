@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=401, type=int)
+parser.add_argument('--num_epochs', default=601, type=int)
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -469,7 +469,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     t1_sampler.close()
 
     # Calculate prompt importance based on validation
-    prompt_model.calculate_prompt_importance(t1_user_valid, args, device)
+    prompt_model.calculate_prompt_importance(t1_data[0], args, device)  # Pass training data
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
