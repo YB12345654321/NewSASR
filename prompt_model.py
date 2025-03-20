@@ -471,53 +471,6 @@ class PromptBaseSASRec(SASRec):
             if 'prompt_bank' not in name:
                 param.requires_grad = True
 
-    def calculate_prompt_importance(self, validation_data, args, device):
-        """
-        Calculate importance of each prompt based on validation performance
-        """
-        print("=== Calculating prompt importance ===")
-        self.eval()
-        
-        # In your implementation, t1_data contains [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum]
-        # So we need to create a proper dataset format using the validation data
-        # First, build a dataset in the right format for evaluate()
-        dataset = [validation_data, validation_data, validation_data, self.usernum, self.itemnum]
-        
-        # First get baseline performance with all prompts
-        with torch.no_grad():
-            baseline_ndcg, _ = evaluate(self, dataset, args, device)
-        print(f"Baseline NDCG: {baseline_ndcg:.4f}")
-        
-        # Store original prompt weights
-        original_prompts = self.prompt_bank.prompts.clone()
-        
-        # Measure performance drop when each prompt is disabled
-        importance = torch.zeros(self.num_prompts, device=self.dev)
-        for i in range(self.num_prompts):
-            with torch.no_grad():
-                # Temporarily zero out this prompt
-                self.prompt_bank.prompts[i] = torch.zeros_like(self.prompt_bank.prompts[i])
-                
-                # Check performance without this prompt
-                masked_ndcg, _ = evaluate(self, dataset, args, device)
-                print(f"Prompt {i} disabled - NDCG: {masked_ndcg:.4f}, Drop: {baseline_ndcg - masked_ndcg:.4f}")
-                
-                # Higher performance drop means higher importance
-                importance[i] = max(0, baseline_ndcg - masked_ndcg)
-                
-                # Restore this prompt
-                self.prompt_bank.prompts[i] = original_prompts[i].clone()
-        
-        # Normalize importance (add small epsilon to avoid division by zero)
-        if torch.sum(importance) > 1e-6:
-            self.prompt_importance = importance / torch.sum(importance)
-        else:
-            # If all zeros, use slightly randomized importance to break ties
-            self.prompt_importance = torch.softmax(torch.randn(self.num_prompts, device=self.dev) * 0.1, dim=0)
-        
-        print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
-        return self.prompt_importance
-
     def freeze_prompts_for_incremental(self):
         """
         Completely freeze all prompts for incremental learning
