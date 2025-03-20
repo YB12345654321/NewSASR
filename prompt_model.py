@@ -64,7 +64,7 @@ class PromptBaseSASRec(SASRec):
         
     def forward(self, u, seq, pos, neg, is_training=True, base_model=None):
         """
-        Forward pass with prompt augmentation
+        Forward pass with prompt augmentation and diversity loss
         """
         # Get mask for valid sequence items
         mask = (seq > 0)
@@ -91,16 +91,37 @@ class PromptBaseSASRec(SASRec):
         valid_positions = mask.sum(dim=1) - 1  # Get index of last valid position
         valid_positions = torch.clamp(valid_positions, min=0)  # Ensure non-negative
         
-        batch_indices = torch.arange(batch_size).to(self.dev)
+        batch_indices = torch.arange(batch_size, device=self.dev)
         query_vectors = seq[batch_indices, valid_positions]
         
-        # Select prompts based on the sequence representation
-        selected_prompts, prompt_weights = self.prompt_bank(query_vectors)
+        # Calculate similarity between query and prompts
+        similarities = torch.matmul(query_vectors, self.prompt_bank.prompts.T) / self.prompt_bank.temperature
         
-        # Update prompt importance if in training mode
+        # Apply softmax to get attention weights
+        prompt_weights = F.softmax(similarities, dim=-1)
+        
+        # Get weighted combination of prompts
+        selected_prompts = torch.matmul(prompt_weights, self.prompt_bank.prompts)
+        
+        # Add diversity loss to encourage prompt specialization
+        diversity_loss = 0.0
         if is_training:
+            # Calculate entropy of prompt selection (higher entropy means more diverse)
+            prompt_entropy = -torch.sum(prompt_weights * torch.log(prompt_weights + 1e-10), dim=-1).mean()
+            
+            # Calculate prompt correlation matrix
+            prompt_corr = torch.matmul(prompt_weights.T, prompt_weights) / batch_size
+            
+            # Get off-diagonal elements (correlations between different prompts)
+            off_diag_mask = 1.0 - torch.eye(self.num_prompts, device=self.dev)
+            off_diag_corr = prompt_corr * off_diag_mask
+            
+            # Diversity loss: minimize correlations between prompts, maximize entropy
+            diversity_loss = off_diag_corr.sum() / (self.num_prompts * (self.num_prompts - 1)) - 0.5 * prompt_entropy
+            
+            # Track prompt usage for importance calculation
             with torch.no_grad():
-                self.prompt_importance += prompt_weights.sum(dim=0)
+                self.prompt_importance += prompt_weights.sum(dim=0).detach()
         
         # Apply dropout
         if is_training:
@@ -166,6 +187,11 @@ class PromptBaseSASRec(SASRec):
             )
             loss += l2_loss
         
+        # Add diversity loss to total loss
+        if is_training:
+            diversity_weight = 0.1  # Adjust as needed
+            loss += diversity_weight * diversity_loss
+        
         # Compute AUC for training info
         auc = torch.sum(
             ((torch.sign(pos_logits - neg_logits) + 1) / 2) * istarget
@@ -176,11 +202,6 @@ class PromptBaseSASRec(SASRec):
             # Get base model predictions
             with torch.no_grad():
                 # Run only the encoding part of the base model
-                base_seq_emb = base_model.item_emb(seq)
-                base_u_emb = base_model.user_emb(u)
-                base_u_emb_expand = base_u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
-                
-                # Get logits from base model
                 base_output = base_model(u, seq, pos, neg, is_training=False)
                 base_attention = base_output[1][0]  # Get attention weights
             
@@ -197,7 +218,7 @@ class PromptBaseSASRec(SASRec):
             loss += distill_alpha * distill_loss
         
         return loss, attention_weights, auc, l2_loss
-    
+
     def predict(self, u, seq, item_idx):
         """
         Make predictions with prompt enhancement
@@ -506,3 +527,86 @@ class PromptBaseSASRec(SASRec):
         # Completely freeze the prompt bank
         for param in self.prompt_bank.parameters():
             param.requires_grad = False
+
+
+    def train_two_phase(self, train_data, valid_data, args, device, num_epochs=None):
+        """
+        Two-phase training: 
+        1. Train the whole model
+        2. Freeze the base model and train only prompts
+        """
+        from util import evaluate
+        
+        if num_epochs is None:
+            num_epochs = args.num_epochs
+            
+        print("=== Phase 1: Training full model ===")
+        
+        # Create optimizer for all parameters
+        phase1_optimizer = torch.optim.Adam(self.parameters(), lr=args.lr, betas=(0.9, 0.98))
+        
+        # Create sampler
+        sampler = WarpSampler(train_data, self.usernum, self.itemnum,
+                            batch_size=args.batch_size, maxlen=args.maxlen,
+                            threshold_user=args.threshold_user,
+                            threshold_item=args.threshold_item,
+                            n_workers=3, device=device)
+        
+        # Train for half the epochs
+        phase1_epochs = num_epochs // 2
+        num_batch = max(len(train_data) // args.batch_size, 1)
+        
+        for epoch in range(1, phase1_epochs + 1):
+            for step in range(num_batch):
+                u, seq, pos, neg = sampler.next_batch()
+                
+                phase1_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase1_optimizer.step()
+            
+            if epoch % args.print_freq == 0:
+                valid_data_format = [train_data, valid_data, {}, self.usernum, self.itemnum]
+                ndcg, hr = evaluate(self, valid_data_format, args, device)
+                print(f"[Phase 1 epoch {epoch}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={loss:.4f}")
+        
+        print("=== Phase 2: Freezing base model, training prompts ===")
+        
+        # Freeze all parameters except prompts
+        for name, param in self.named_parameters():
+            if 'prompt_bank' not in name:
+                param.requires_grad = False
+        
+        # Create optimizer for prompt parameters only
+        phase2_optimizer = torch.optim.Adam(
+            self.prompt_bank.parameters(), 
+            lr=args.lr * 0.5,  # Lower learning rate for fine-tuning
+            betas=(0.9, 0.98)
+        )
+        
+        # Train for remaining epochs
+        phase2_epochs = num_epochs - phase1_epochs
+        
+        for epoch in range(1, phase2_epochs + 1):
+            for step in range(num_batch):
+                u, seq, pos, neg = sampler.next_batch()
+                
+                phase2_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase2_optimizer.step()
+            
+            if epoch % args.print_freq == 0:
+                valid_data_format = [train_data, valid_data, {}, self.usernum, self.itemnum]
+                ndcg, hr = evaluate(self, valid_data_format, args, device)
+                print(f"[Phase 2 epoch {epoch}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={loss:.4f}")
+        
+        # Unfreeze all parameters for future incremental learning
+        for param in self.parameters():
+            param.requires_grad = True
+        
+        # Calculate prompt importance 
+        self.calculate_prompt_importance(valid_data, args, device)
+        
+        # Close sampler
+        sampler.close()

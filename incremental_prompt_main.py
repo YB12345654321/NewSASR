@@ -192,7 +192,7 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     # Train on T1
     num_batch = max(len(t1_user_train) // args.batch_size, 1)
     t0 = time.time()
-    
+
     for epoch in range(1, args.num_epochs + 1):
         for step in range(num_batch):
             u, seq, pos, neg = t1_sampler.next_batch()
@@ -290,7 +290,7 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
         replay_buffer.update_buffer(slice_buffer)
         
         # Train for fewer epochs
-        inc_epochs = args.num_epochs // 2  # Fewer epochs for incremental learning
+        inc_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
         t0 = time.time()
 
         for epoch in range(1, inc_epochs + 1):
@@ -404,18 +404,8 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
 
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
-    Run prompt-based incremental learning experiment
-    
-    Args:
-        args: Command line arguments
-        time_data: TimeSlicedData object
-        base_model: Base model trained on T1
-        t1_items: Items from T1
-        output_dir: Output directory for saving results
-        log_file: Log file object
-        
-    Returns:
-        Dictionary of results
+    Run prompt-based incremental learning experiment with two-phase training
+    and diversity loss
     """
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -427,49 +417,12 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     # Initialize prompt-based model
     print("\n=== Training Prompt-Based Model on T1 ===")
     prompt_model = PromptBaseSASRec(usernum, itemnum, args).to(device)
-    prompt_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=args.lr, betas=(0.9, 0.98))
 
     # Initialize prompt manager
     prompt_manager = PromptManager(prompt_model, args.num_prompts, args.importance_threshold)
 
-    # T1 sampler
-    t1_sampler = WarpSampler(t1_user_train, usernum, itemnum,
-                        batch_size=args.batch_size, maxlen=args.maxlen,
-                        threshold_user=args.threshold_user,
-                        threshold_item=args.threshold_item,
-                        n_workers=3, device=device)
-
-    # Train on T1
-    num_batch = max(len(t1_user_train) // args.batch_size, 1)
-    t0 = time.time()
-
-    for epoch in range(1, args.num_epochs + 1):
-        for step in range(num_batch):
-            u, seq, pos, neg = t1_sampler.next_batch()
-            
-            prompt_optimizer.zero_grad()
-            loss, attention_weights, auc, l2_loss = prompt_model(u, seq, pos, neg, is_training=True)
-            loss.backward()
-            prompt_optimizer.step()
-            
-        if epoch % args.print_freq == 0:
-            t1 = time.time() - t0
-            
-            if check_dataset_validity(t1_data):
-                t_test = evaluate(prompt_model, t1_data, args, device)
-                log_file.write(f"Prompt-based model epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
-                log_file.flush()
-                print(f"[Prompt model epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
-            else:
-                print(f"[Prompt model epoch {epoch}] No valid test users found for evaluation. Skipping.")
-            
-            t0 = time.time()
-
-    # Close T1 sampler
-    t1_sampler.close()
-
-    # Calculate prompt importance based on validation
-    prompt_model.calculate_prompt_importance(t1_data[0], args, device)  # Pass training data
+    # Use two-phase training for T1 (match the method name in prompt_model.py)
+    prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, args, device)
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
@@ -546,7 +499,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         replay_buffer.update_buffer(slice_buffer)
         
         # Train for fewer epochs
-        inc_epochs = args.num_epochs // 2  # Fewer epochs for incremental learning
+        inc_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
         t0 = time.time()
 
         for epoch in range(1, inc_epochs + 1):
@@ -611,14 +564,14 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                         pos = torch.cat([pos, r_poss_tensor])
                         neg = torch.cat([neg, r_negs_tensor])
                 
-                # Update model with knowledge distillation
+                # Update model with knowledge distillation from base model
                 inc_optimizer.zero_grad()
-                # We don't pass a base_model here since the prompt mechanism handles forgetting
-                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True)
+                # Pass base_model to enable knowledge distillation during incremental learning
+                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=base_model)
                 loss.backward()
                 inc_optimizer.step()
             
-            if epoch % args.print_freq  == 0:
+            if epoch % args.print_freq == 0:
                 t1 = time.time() - t0
                 
                 # Evaluate on current slice
