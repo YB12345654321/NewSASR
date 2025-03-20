@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=500, type=int) # was 20
+parser.add_argument('--num_epochs', default=5, type=int) # was 20
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -402,8 +402,6 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     
     return results, base_model, t1_items
 
-# In incremental_prompt_main.py, modify the run_prompt_incremental_learning function:
-
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
     Run prompt-based incremental learning experiment with two-phase training
@@ -566,11 +564,10 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                         pos = torch.cat([pos, r_poss_tensor])
                         neg = torch.cat([neg, r_negs_tensor])
                 
-                # Update model without knowledge distillation from base model
-                # Change: pass None instead of base_model to disable knowledge distillation
+                # Update model with knowledge distillation from base model
                 inc_optimizer.zero_grad()
-                # We're passing None here instead of base_model to disable knowledge distillation
-                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=None)
+                # Pass base_model to enable knowledge distillation during incremental learning
+                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=base_model)
                 loss.backward()
                 inc_optimizer.step()
             

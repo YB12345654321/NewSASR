@@ -34,6 +34,9 @@ class Embedding(nn.Module):
         nn.init.xavier_uniform_(self.embedding.weight)
 
     def forward(self, inputs):
+        # print(type(inputs))
+        if inputs.dtype != torch.long:
+            inputs = inputs.long()
         x = self.embedding(inputs)
         if self.scale:
             x = x * (self.num_units ** 0.5)

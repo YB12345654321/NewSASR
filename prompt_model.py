@@ -202,6 +202,10 @@ class PromptBaseSASRec(SASRec):
             # Get base model predictions
             with torch.no_grad():
                 # Run only the encoding part of the base model
+                u_tensor = u.to(self.dev).long()
+                seq_tensor = seq.to(self.dev).long()
+                pos_tensor = pos.reshape(-1).to(self.dev).long()  # Ensure it's flattened as the model expects
+                neg_tensor = neg.reshape(-1).to(self.dev).long() 
                 base_output = base_model(u, seq, pos, neg, is_training=False)
                 base_attention = base_output[1][0]  # Get attention weights
             
@@ -333,7 +337,7 @@ class PromptBaseSASRec(SASRec):
         Train the model with separate phases for base model and prompts
         """
         # Create samplers and optimizers
-        t1_sampler = WarpSampler(train_data, args.usernum, args.itemnum,
+        t1_sampler = WarpSampler(train_data, self.usernum, self.itemnum,
                             batch_size=args.batch_size, maxlen=args.maxlen,
                             threshold_user=args.threshold_user,
                             threshold_item=args.threshold_item,
@@ -369,7 +373,8 @@ class PromptBaseSASRec(SASRec):
                 phase1_optimizer.step()
                 
             if epoch % args.print_freq == 0:
-                t_test = evaluate(self, [train_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
+                t_test = evaluate(self, [train_data, valid_data, {}, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 1 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
         # Phase 2: Train prompts with frozen base model
@@ -405,7 +410,8 @@ class PromptBaseSASRec(SASRec):
                 phase2_optimizer.step()
                 
             if epoch % args.print_freq == 0:
-                t_test = evaluate(self, [train_data, valid_data, {}, args.usernum, args.itemnum], args, device)
+                # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
+                t_test = evaluate(self, [train_data, valid_data, {}, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 2 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
         # Close sampler
@@ -413,6 +419,7 @@ class PromptBaseSASRec(SASRec):
         
         # Calculate prompt importance
         self.calculate_prompt_importance(valid_data, args, device)
+
         
     def calculate_prompt_importance(self, validation_data, args, device):
         """

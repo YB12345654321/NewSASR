@@ -59,7 +59,8 @@ class SASRec(nn.Module):
         
         # Get embeddings
         seq_emb = self.item_emb(seq)  # [B, L, H_item]
-        
+        if seq.size(1)<=0:
+            print("Error here: ",seq.size(1))
         # Position encoding
         pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(self.dev)
         pos_ids = pos_ids.unsqueeze(0).expand_as(seq)  # [B, L]
