@@ -30,7 +30,7 @@ parser.add_argument('--maxlen', default=50, type=int)
 parser.add_argument('--user_hidden_units', default=50, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
-parser.add_argument('--num_epochs', default=500, type=int) # was 20
+parser.add_argument('--num_epochs', default=20, type=int) # was 20
 parser.add_argument('--num_heads', default=1, type=int)
 parser.add_argument('--dropout_rate', default=0.5, type=float)
 parser.add_argument('--threshold_user', default=1.0, type=float)
@@ -424,7 +424,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     prompt_manager = PromptManager(prompt_model, args.num_prompts, args.importance_threshold)
 
     # Use two-phase training for T1 (match the method name in prompt_model.py)
-    prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, args, device)
+    prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, t1_user_test, args, device)
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))

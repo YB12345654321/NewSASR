@@ -332,7 +332,7 @@ class PromptBaseSASRec(SASRec):
             self.prompt_bank.prompts.register_hook(
                 lambda grad: hook(grad, keep_mask)
             )
-    def train_with_separate_prompt_phases(self, train_data, valid_data, args, device):
+    def train_with_separate_prompt_phases(self, train_data, valid_data, test_data, args, device):
         """
         Train the model with separate phases for base model and prompts
         """
@@ -374,7 +374,7 @@ class PromptBaseSASRec(SASRec):
                 
             if epoch % args.print_freq == 0:
                 # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
-                t_test = evaluate(self, [train_data, valid_data, {}, self.usernum, self.itemnum], args, device)
+                t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 1 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
         # Phase 2: Train prompts with frozen base model
@@ -411,7 +411,7 @@ class PromptBaseSASRec(SASRec):
                 
             if epoch % args.print_freq == 0:
                 # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
-                t_test = evaluate(self, [train_data, valid_data, {}, self.usernum, self.itemnum], args, device)
+                t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 2 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
         # Close sampler

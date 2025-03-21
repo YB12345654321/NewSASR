@@ -40,7 +40,7 @@ def data_partition(fname):
 def evaluate(model, dataset, args, device='cuda'):
     model.eval()
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
-
+    # print(test)
     NDCG = 0.0
     HT = 0.0
     valid_user = 0.0
@@ -51,10 +51,21 @@ def evaluate(model, dataset, args, device='cuda'):
         users = random.sample(all_users, 10000)
     else:
         users = all_users
-        
+
     with torch.no_grad():
+        user_num = 0
         for u in users:
+            user_num+=1
             if u not in train or u not in test or len(train[u]) < 1 or len(test[u]) < 1: 
+                print(user_num, 'no training data or test data')
+                if u not in train:
+                    print('not in train')
+                if u not in test:
+                    print('not in test')
+                # if len(train[u])<1:
+                #     print('not train data')
+                # if len(test[u])<1:
+                #     print('no test data')
                 continue
 
             seq = np.zeros([args.maxlen], dtype=np.int64)
@@ -100,7 +111,7 @@ def evaluate(model, dataset, args, device='cuda'):
     if valid_user > 0:
         return NDCG / valid_user, HT / valid_user
     else:
-        return 0.0, 0.0
+        return -0.01, -0.01
 
 def evaluate_valid(model, dataset, args, device='cuda'):
     model.eval()
