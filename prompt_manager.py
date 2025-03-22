@@ -28,6 +28,15 @@ class PromptManager:
         self.old_items = set(old_items)
         self.new_items = set(new_items)
         self.prompt_model.update_item_sets(old_items, new_items)
+        
+    def update_prompt_count(self):
+        """Update the number of prompts based on the model's current prompt count"""
+        current_count = self.prompt_model.prompt_bank.prompts.size(0)
+        if self.num_prompts != current_count:
+            self.num_prompts = current_count
+            print(f"PromptManager: Updated prompt count to {self.num_prompts}")
+        return self.num_prompts
+
     def analyze_prompts(self, dataset, args, device):
         """
         Analyze how prompts are used for different users/items
@@ -42,6 +51,8 @@ class PromptManager:
             Dictionary of analysis results
         """
         self.prompt_model.eval()
+        self.update_prompt_count()
+
         
         results = {
             'prompt_usage': {},
@@ -127,8 +138,44 @@ class PromptManager:
                 _, prompt_weights, top_k_indices = self.prompt_model.prompt_bank(query_vectors, top_k=3)
                 
                 # Update overall prompt usage
+                # prompt_usage += prompt_weights.squeeze(0)
+                # Get the current shape of prompt_weights after squeezing
+                current_weights_size = prompt_weights.squeeze(0).size(0)
+
+                # Ensure prompt_usage is the right size
+                if prompt_usage.size(0) != current_weights_size:
+                    # Create a new tensor of the right size and copy existing values where possible
+                    new_prompt_usage = torch.zeros(current_weights_size, device=device)
+                    min_size = min(prompt_usage.size(0), current_weights_size)
+                    new_prompt_usage[:min_size] = prompt_usage[:min_size]
+                    prompt_usage = new_prompt_usage
+                    
+                    # Also resize other tensors that depend on prompt count
+                    new_top_k_selections = torch.zeros(current_weights_size, device=device)
+                    new_top_k_selections[:min_size] = top_k_selections[:min_size]
+                    top_k_selections = new_top_k_selections
+                    
+                    new_old_item_usage = torch.zeros(current_weights_size, device=device)
+                    new_old_item_usage[:min_size] = old_item_usage[:min_size]
+                    old_item_usage = new_old_item_usage
+                    
+                    new_new_item_usage = torch.zeros(current_weights_size, device=device)
+                    new_new_item_usage[:min_size] = new_item_usage[:min_size]
+                    new_item_usage = new_new_item_usage
+                    
+                    new_unseen_item_usage = torch.zeros(current_weights_size, device=device)
+                    new_unseen_item_usage[:min_size] = unseen_item_usage[:min_size]
+                    unseen_item_usage = new_unseen_item_usage
+                    
+                    # Resize cooccurrence matrix
+                    new_cooccurrence = torch.zeros(current_weights_size, current_weights_size, device=device)
+                    min_size = min(prompt_cooccurrence.size(0), current_weights_size)
+                    new_cooccurrence[:min_size, :min_size] = prompt_cooccurrence[:min_size, :min_size]
+                    prompt_cooccurrence = new_cooccurrence
+
+                # Now we can safely add
                 prompt_usage += prompt_weights.squeeze(0)
-                
+                                
                 # Update top-k selection count
                 for idx in top_k_indices.squeeze(0):
                     top_k_selections[idx] += 1
