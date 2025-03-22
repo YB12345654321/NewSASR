@@ -55,7 +55,6 @@ parser.add_argument('--save_splits', action='store_true', help='Whether to save 
 # Prompt-based arguments
 parser.add_argument('--num_prompts', default=8, type=int, help='Number of prompts in the bank')
 parser.add_argument('--prompt_mix_ratio', default=0.3, type=float, help='Mixing ratio for prompts')
-parser.add_argument('--importance_threshold', default=0.7, type=float, help='Threshold for prompt importance')
 parser.add_argument('--run_both', action='store_true', help='Run both regular incremental and prompt-based models')
 
 def set_seed(seed):
@@ -402,8 +401,6 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     
     return results, base_model, t1_items
 
-# In incremental_prompt_main.py, modify the run_prompt_incremental_learning function:
-
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
     Run prompt-based incremental learning experiment with two-phase training
@@ -421,7 +418,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     prompt_model = PromptBaseSASRec(usernum, itemnum, args).to(device)
 
     # Initialize prompt manager
-    prompt_manager = PromptManager(prompt_model, args.num_prompts, args.importance_threshold)
+    prompt_manager = PromptManager(prompt_model, args.num_prompts)
 
     # Use two-phase training for T1 (match the method name in prompt_model.py)
     prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, t1_user_test, args, device)
@@ -470,9 +467,6 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     # Incremental learning on subsequent slices
     for slice_idx in range(1, args.num_slices):
         print(f"\n=== Prompt-Based Incremental Learning on Slice {slice_idx} ===")
-        
-        # Prepare prompt manager for this slice
-        prompt_manager.prepare_for_training(slice_idx)
         
         # Get slice data
         slice_data = time_data.prepare_slice(slice_idx, include_previous=False)
@@ -569,7 +563,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 # Update model without knowledge distillation from base model
                 # Change: pass None instead of base_model to disable knowledge distillation
                 inc_optimizer.zero_grad()
-                # We're passing None here instead of base_model to disable knowledge distillation
+# We're passing None instead of base_model to disable knowledge distillation
                 loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=None)
                 loss.backward()
                 inc_optimizer.step()

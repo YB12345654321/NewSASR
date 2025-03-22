@@ -54,9 +54,6 @@ class PromptBaseSASRec(SASRec):
         # Create prompt bank
         self.prompt_bank = PromptBank(prompt_dim, self.num_prompts)
         
-        # Importance weights for each prompt (for continual learning)
-        self.register_buffer('prompt_importance', torch.zeros(self.num_prompts, device=self.dev))
-        
         # For tracking performance
         self.seen_items = set()
         self.new_items = set()
@@ -121,10 +118,6 @@ class PromptBaseSASRec(SASRec):
             # Diversity loss: minimize correlations between prompts, maximize entropy
             diversity_loss = off_diag_corr.sum() / (self.num_prompts * (self.num_prompts - 1)) - 0.5 * prompt_entropy
             
-            # Track prompt usage for importance calculation
-            with torch.no_grad():
-                self.prompt_importance += prompt_weights.sum(dim=0).detach()
-        
         # Apply dropout
         if is_training:
             seq = self.dropout(seq)
@@ -309,31 +302,7 @@ class PromptBaseSASRec(SASRec):
         """
         self.seen_items = set(old_items)
         self.new_items = set(new_items)
-        
-    def freeze_important_prompts(self, importance_threshold=0.7):
-        """
-        Create gradient masks for prompt parameters to prevent updates to important prompts
-        
-        Args:
-            importance_threshold: Threshold for determining which prompts to freeze
-        """
-        # Normalize importance scores
-        if torch.sum(self.prompt_importance) > 0:
-            normalized_importance = self.prompt_importance / torch.sum(self.prompt_importance)
-            
-            # Identify prompts to keep frozen (ensure mask is on the right device)
-            keep_mask = normalized_importance > importance_threshold
-            
-            # Apply hooks to parameters
-            def hook(grad, mask):
-                # Ensure mask is on the same device as grad
-                mask = mask.to(grad.device)
-                return grad * (~mask).float().unsqueeze(1)
-            
-            # Register hook
-            self.prompt_bank.prompts.register_hook(
-                lambda grad: hook(grad, keep_mask)
-            )
+
     def train_with_separate_prompt_phases(self, train_data, valid_data, test_data, args, device):
         """
         Train the model with separate phases for base model and prompts
@@ -418,178 +387,6 @@ class PromptBaseSASRec(SASRec):
         
         # Close sampler
         t1_sampler.close()
-        
-        # Calculate prompt importance
-        self.calculate_prompt_importance(valid_data, args, device)
-
-        
-    # def calculate_prompt_importance(self, validation_data, args, device):
-    #     """
-    #     Calculate importance of each prompt based on validation performance
-    #     """
-    #     print("=== Calculating prompt importance ===")
-    #     self.eval()
-
-    #     eval_dataset = [validation_data, {}, validation_data, self.usernum, self.itemnum]
-        
-    #     # First get baseline performance with all prompts
-    #     with torch.no_grad():
-    #         baseline_ndcg, _ = evaluate(self, eval_dataset, args, device)
-        
-    #     # Store original prompt weights
-    #     original_prompts = self.prompt_bank.prompts.clone()
-        
-    #     # Measure performance drop when each prompt is disabled
-    #     importance = torch.zeros(self.num_prompts, device=self.dev)
-    #     for i in range(self.num_prompts):
-    #         with torch.no_grad():
-    #             # Temporarily zero out this prompt
-    #             self.prompt_bank.prompts[i] = torch.zeros_like(self.prompt_bank.prompts[i])
-                
-    #             # Check performance without this prompt
-    #             masked_ndcg, _ = evaluate(self, eval_dataset, args, device)
-                
-    #             # Higher performance drop means higher importance
-    #             importance[i] = max(0, baseline_ndcg - masked_ndcg)
-                
-    #             # Restore this prompt
-    #             self.prompt_bank.prompts[i] = original_prompts[i].clone()
-        
-    #     # Normalize importance (add small epsilon to avoid division by zero)
-    #     if torch.sum(importance) > 1e-6:
-    #         self.prompt_importance = importance / torch.sum(importance)
-    #     else:
-    #         print("all zeros")
-    #         # If all zeros, use slightly randomized importance to break ties
-    #         self.prompt_importance = torch.softmax(torch.randn(self.num_prompts, device=self.dev) * 0.1, dim=0)
-        
-    #     print(f"Prompt importance: {self.prompt_importance.cpu().numpy()}")
-    #     return self.prompt_importance
-
-    def calculate_prompt_importance(self, validation_data, args, device):
-        """
-        Modified importance calculation that can detect more subtle effects
-        """
-        print("=== Calculating prompt importance ===")
-        self.eval()
-
-        # More sensitive evaluation - use item ranking directly
-        def evaluate_ranking(model, user_data, items_to_rank=200):
-            # Sample users
-            sample_users = random.sample(list(user_data.keys()), min(100, len(user_data)))
-            total_ranks = []
-            
-            with torch.no_grad():
-                for u in sample_users:
-                    if len(user_data[u]) < 2:  # Need at least one item in history, one for testing
-                        continue
-                    
-                    # Prepare sequence from history
-                    seq = np.zeros([args.maxlen], dtype=np.int64)
-                    idx = args.maxlen - 1
-                    for i in reversed(user_data[u][:-1]):  # All but last item
-                        seq[idx] = i
-                        idx -= 1
-                        if idx == -1: break
-                    
-                    # Last item is test item
-                    test_item = user_data[u][-1]
-                    
-                    # Random negative items
-                    neg_items = set()
-                    while len(neg_items) < items_to_rank - 1:
-                        neg = random.randint(1, model.itemnum)
-                        if neg != test_item and neg not in user_data[u]:
-                            neg_items.add(neg)
-                    
-                    # Create tensors
-                    seq_tensor = torch.LongTensor(seq).unsqueeze(0).to(device)
-                    user_tensor = torch.LongTensor([u]).to(device)
-                    item_tensor = torch.LongTensor([test_item] + list(neg_items)).to(device)
-                    
-                    # Get predictions
-                    scores = model.predict(user_tensor, seq_tensor, item_tensor)
-                    _, indices = torch.sort(scores[0])
-                    
-                    # Find rank of positive item (smaller rank is better)
-                    rank = (indices == 0).nonzero().item()
-                    total_ranks.append(rank)
-            
-            # Average rank (lower is better)
-            if total_ranks:
-                return sum(total_ranks) / len(total_ranks)
-            return float('inf')
-        
-        # Measure baseline performance
-        baseline_perf = evaluate_ranking(self, validation_data)
-        
-        # Store original prompts
-        original_prompts = self.prompt_bank.prompts.clone().detach()
-        
-        # Measure importance with a more sensitive metric
-        new_importance = torch.zeros(self.num_prompts, device=self.dev)
-        
-        for i in range(self.num_prompts):
-            with torch.no_grad():
-                # Zero out this prompt
-                self.prompt_bank.prompts[i] = torch.zeros_like(self.prompt_bank.prompts[i])
-                
-                # Check performance
-                masked_perf = evaluate_ranking(self, validation_data)
-                
-                # Importance is how much worse ranking gets (higher rank = worse)
-                # Adding small constant to ensure non-zero importance
-                perf_drop = max(0, masked_perf - baseline_perf) + 0.01
-                new_importance[i] = perf_drop
-                
-                # Restore prompt
-                self.prompt_bank.prompts[i] = original_prompts[i].clone()
-        
-        # Add random noise to break ties
-        noise = torch.rand(self.num_prompts, device=self.dev) * 0.005
-        new_importance = new_importance + noise
-        
-        # Use exponential moving average
-        if hasattr(self, 'raw_importance') and self.raw_importance is not None:
-            decay = 0.7
-            self.raw_importance = decay * self.raw_importance + (1 - decay) * new_importance
-        else:
-            self.raw_importance = new_importance
-        
-        # Store and normalize for display
-        self.prompt_importance = self.raw_importance.clone()
-        normalized = self.prompt_importance / (torch.sum(self.prompt_importance) + 1e-8)
-        
-        print(f"Prompt importance: {normalized.cpu().numpy()}")
-        print(f"Raw values (should NOT be all equal): {self.raw_importance.cpu().numpy()}")
-        
-        return self.prompt_importance
-        
-    def prepare_for_incremental_learning(self):
-        """
-        Prepare for incremental learning by completely freezing all prompts
-        """
-        print("=== Freezing all prompts for incremental learning ===")
-        
-        # Completely freeze the prompt bank
-        for param in self.prompt_bank.parameters():
-            param.requires_grad = False
-        
-        # The rest of the model can still learn
-        for name, param in self.named_parameters():
-            if 'prompt_bank' not in name:
-                param.requires_grad = True
-
-    def freeze_prompts_for_incremental(self):
-        """
-        Completely freeze all prompts for incremental learning
-        """
-        print("=== Freezing all prompts for incremental learning ===")
-        
-        # Completely freeze the prompt bank
-        for param in self.prompt_bank.parameters():
-            param.requires_grad = False
-
 
     def train_two_phase(self, train_data, valid_data, args, device, num_epochs=None):
         """
@@ -666,9 +463,6 @@ class PromptBaseSASRec(SASRec):
         # Unfreeze all parameters for future incremental learning
         for param in self.parameters():
             param.requires_grad = True
-        
-        # Calculate prompt importance 
-        self.calculate_prompt_importance(valid_data, args, device)
         
         # Close sampler
         sampler.close()
