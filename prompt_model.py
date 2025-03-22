@@ -441,7 +441,11 @@ class PromptBaseSASRec(SASRec):
                 t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 3 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
-        
+            # After Phase 3 is complete (all training phases on T1)
+        print("=== Freezing prompts after initial training ===")
+        for param in self.prompt_bank.parameters():
+            param.requires_grad = False
+
         # Close sampler
         t1_sampler.close()
 
