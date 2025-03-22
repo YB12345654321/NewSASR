@@ -421,11 +421,10 @@ def freeze_prompts(model, freeze=True):
     else:
         print("Prompts are now trainable")
 
-
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
-    Run prompt-based incremental learning experiment with two-phase training
-    and diversity loss, freezing prompts after initial training
+    Run prompt-based incremental learning experiment with hybrid prompt freezing
+    and new prompt generation during incremental learning
     """
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -441,14 +440,29 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     # Initialize prompt manager
     prompt_manager = PromptManager(prompt_model, args.num_prompts)
 
-    # Use three-phase training for T1 (match the method name in prompt_model.py)
-    # The prompts will be frozen at the end of this function
+    # Use three-phase training for T1
     prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, t1_user_test, args, device)
     
-    # Verify prompts are frozen after three-phase training
-    print("=== Double-checking prompts are frozen after initial training ===")
-    for param in prompt_model.prompt_bank.parameters():
-        param.requires_grad = False
+    # Implement hybrid prompt freezing strategy
+    print("=== Implementing hybrid prompt freezing strategy ===")
+    # Calculate prompt importance based on usage
+    prompt_usage = prompt_model.analyze_prompt_usage(t1_user_train, args, device)
+    
+    # Sort prompts by importance/usage
+    prompt_importance = torch.tensor(prompt_usage)
+    _, sorted_indices = torch.sort(prompt_importance, descending=True)
+    
+    # Freeze the top 16 most important prompts (memory prompts)
+    frozen_count = min(16, prompt_model.num_prompts)
+    for i in range(prompt_model.num_prompts):
+        if i in sorted_indices[:frozen_count]:
+            # Freeze this prompt
+            prompt_model.prompt_bank.prompts[i].requires_grad = False
+            print(f"Prompt {i} frozen (memory prompt)")
+        else:
+            # Keep this prompt trainable
+            prompt_model.prompt_bank.prompts[i].requires_grad = True
+            print(f"Prompt {i} remains trainable (adaptive prompt)")
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
@@ -495,14 +509,25 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     for slice_idx in range(1, args.num_slices):
         print(f"\n=== Prompt-Based Incremental Learning on Slice {slice_idx} ===")
         
-        # Double-check prompts are still frozen before training
-        print("=== Ensuring prompts remain frozen during incremental learning ===")
-        for param in prompt_model.prompt_bank.parameters():
-            param.requires_grad = False
+        # Ensure hybrid prompt freezing during incremental learning
+        print("=== Ensuring hybrid prompt freezing during incremental learning ===")
+        for i in range(prompt_model.num_prompts):
+            if i < 16:  # First 16 prompts are memory prompts
+                for param in [p for n, p in prompt_model.named_parameters() if f'prompt_bank.prompts.{i}' in n]:
+                    param.requires_grad = False
+            else:
+                for param in [p for n, p in prompt_model.named_parameters() if f'prompt_bank.prompts.{i}' in n]:
+                    param.requires_grad = True
         
         # Get slice data
         slice_data = time_data.prepare_slice(slice_idx, include_previous=False)
         [slice_user_train, slice_user_valid, slice_user_test, _, _] = slice_data
+        
+        # Generate new prompts from current slice
+        if slice_idx > 1:  # After the first incremental update
+            # Generate new prompts from current slice
+            new_prompt_count = prompt_model.generate_new_prompts(slice_data, num_new_prompts=4, device=device)
+            print(f"Prompt bank now has {new_prompt_count} prompts ({new_prompt_count-24} new prompts)")
         
         # Get slice items
         slice_users, slice_items = time_data.get_slice_data(slice_idx)
@@ -518,10 +543,10 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                                   threshold_item=args.threshold_item,
                                   n_workers=3, device=device)
         
-        # Create optimizer with lower learning rate - EXCLUDE PROMPT PARAMETERS
+        # Create optimizer with lower learning rate - EXCLUDE FROZEN PROMPT PARAMETERS
         inc_lr = args.lr * 0.1  # Lower learning rate for stability
         optimizer_params = [p for n, p in prompt_model.named_parameters() 
-                           if 'prompt_bank' not in n and p.requires_grad]
+                           if not ('prompt_bank.prompts' in n and not p.requires_grad)]
         inc_optimizer = torch.optim.Adam(optimizer_params, lr=inc_lr, betas=(0.9, 0.98))
         
         # Create new replay buffer for this slice
@@ -601,10 +626,9 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 inc_optimizer.step()
                 
                 # Double-check prompts remain frozen during training
-                for param in prompt_model.prompt_bank.parameters():
-                    if param.grad is not None:
-                        # Zero out any gradients that might have accumulated for prompt parameters
-                        param.grad.zero_()
+                for i in range(min(16, prompt_model.num_prompts)):
+                    if prompt_model.prompt_bank.prompts[i].grad is not None:
+                        prompt_model.prompt_bank.prompts[i].grad.zero_()
             
             if epoch % args.print_freq == 0:
                 t1 = time.time() - t0
@@ -651,6 +675,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     print("\n=== Prompt-Based Incremental Learning Experiment Completed ===")
     
     return results
+
 
 def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
     """

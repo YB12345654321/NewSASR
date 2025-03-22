@@ -528,3 +528,140 @@ class PromptBaseSASRec(SASRec):
         
         # Close sampler
         sampler.close()
+
+    def generate_new_prompts(self, slice_data, num_new_prompts=4, device='cuda'):
+        """Generate new prompts from current slice data patterns"""
+        print(f"Generating {num_new_prompts} new prompts from current slice data")
+        
+        # Extract representations from current slice data
+        user_train = slice_data[0]
+        
+        # Create sampler for this slice
+        from sampler import WarpSampler
+        sampler = WarpSampler(user_train, self.usernum, self.itemnum,
+                        batch_size=128, maxlen=self.args.maxlen,
+                        threshold_user=self.args.threshold_user,
+                        threshold_item=self.args.threshold_item,
+                        n_workers=1, device=device)
+        
+        # Collect sequence representations
+        sequence_reprs = []
+        num_samples = min(1000, len(user_train))
+        
+        with torch.no_grad():
+            for _ in range(num_samples // 128 + 1):
+                u, seq, _, _ = sampler.next_batch()
+                if len(u) == 0:
+                    break
+                    
+                # Get embeddings
+                mask = (seq > 0)
+                seq_emb = self.item_emb(seq)
+                pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(device)
+                pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
+                pos_emb = self.pos_emb(pos_ids)
+                u_emb = self.user_emb(u)
+                u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
+                seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                seq_repr += pos_emb
+                
+                # Get last valid position
+                valid_positions = mask.sum(dim=1) - 1
+                valid_positions = torch.clamp(valid_positions, min=0)
+                batch_indices = torch.arange(seq.size(0), device=device)
+                
+                # Extract representations
+                for i in range(len(u)):
+                    pos = valid_positions[i].item()
+                    repr = seq_repr[i, pos, :].detach().cpu().numpy()
+                    sequence_reprs.append(repr)
+                    
+                    if len(sequence_reprs) >= num_samples:
+                        break
+                
+                if len(sequence_reprs) >= num_samples:
+                    break
+        
+        sampler.close()
+        
+        # Apply clustering to find new prompt patterns
+        if len(sequence_reprs) > num_new_prompts:
+            from sklearn.cluster import KMeans
+            sequence_reprs = np.array(sequence_reprs)
+            kmeans = KMeans(n_clusters=num_new_prompts, random_state=42).fit(sequence_reprs)
+            new_prompts = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32, device=device)
+        else:
+            # Not enough samples, just use what we have
+            new_prompts = torch.tensor(np.array(sequence_reprs), dtype=torch.float32, device=device)
+        
+        # Add new prompts to the prompt bank
+        current_prompts = self.prompt_bank.prompts.data
+        combined_prompts = torch.cat([current_prompts, new_prompts])
+        
+        # Update prompt bank
+        self.prompt_bank.prompts = nn.Parameter(combined_prompts)
+        self.num_prompts = combined_prompts.size(0)
+        
+        print(f"Prompt bank expanded to {self.num_prompts} prompts")
+        
+        # Set the new prompts as trainable
+        # Only the newly added prompts will be trainable if we maintain hybrid freezing
+        old_prompt_count = current_prompts.size(0)
+        for i in range(old_prompt_count, self.num_prompts):
+            self.prompt_bank.prompts[i].requires_grad = True
+            
+        return self.num_prompts
+
+
+    def analyze_prompt_usage(self, user_train, args, device):
+        """Analyze how frequently each prompt is selected as important"""
+        prompt_usage = torch.zeros(self.num_prompts, device=device)
+        
+        # Create a minimal loader for analysis
+        from sampler import WarpSampler
+        sampler = WarpSampler(user_train, self.usernum, self.itemnum,
+                        batch_size=args.batch_size, maxlen=args.maxlen,
+                        threshold_user=args.threshold_user,
+                        threshold_item=args.threshold_item,
+                        n_workers=1, device=device)
+        
+        # Sample some batches
+        num_batches = min(100, max(len(user_train) // args.batch_size, 10))
+        
+        with torch.no_grad():
+            for _ in range(num_batches):
+                u, seq, _, _ = sampler.next_batch()
+                
+                # Get mask for valid items
+                mask = (seq > 0)
+                
+                # Get embeddings and prepare for prompt selection
+                seq_emb = self.item_emb(seq)
+                pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(device)
+                pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
+                pos_emb = self.pos_emb(pos_ids)
+                u_emb = self.user_emb(u)
+                u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
+                seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                seq_repr += pos_emb
+                
+                # Get query vectors
+                valid_positions = mask.sum(dim=1) - 1
+                valid_positions = torch.clamp(valid_positions, min=0)
+                batch_indices = torch.arange(seq.size(0), device=device)
+                query_vectors = seq_repr[batch_indices, valid_positions]
+                
+                # Get prompt weights
+                _, prompt_weights, top_k_indices = self.prompt_bank(query_vectors)
+                
+                # Update usage statistics
+                for indices in top_k_indices:
+                    for idx in indices:
+                        prompt_usage[idx] += 1
+                        
+        # Normalize usage
+        if torch.sum(prompt_usage) > 0:
+            prompt_usage = prompt_usage / torch.sum(prompt_usage)
+        
+        sampler.close()
+        return prompt_usage
