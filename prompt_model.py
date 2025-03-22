@@ -2,25 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+import random
+import numpy as np
 from model_v1 import SASRec
 from util import evaluate
 from sampler import WarpSampler
-import random
-import numpy as np
 
 class PromptBank(nn.Module):
     """
     A bank of learnable prompts that capture different user behavior patterns
     """
-    def __init__(self, prompt_dim, num_prompts=8, initial_prompts=None):
+    def __init__(self, prompt_dim, num_prompts=8):
         super(PromptBank, self).__init__()
-        
-        # Initialize prompts - either with provided values or randomly
-        if initial_prompts is not None:
-            self.prompts = nn.Parameter(initial_prompts)
-        else:
-            self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
-            
+        # Initialize learnable prompt vectors
+        self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
         
     def forward(self, query_embedding, top_k=3):
@@ -29,10 +24,9 @@ class PromptBank(nn.Module):
         
         Args:
             query_embedding: Embedding used to query the prompt bank
-            top_k: Number of top prompts to consider
             
         Returns:
-            Selected prompt embeddings, attention weights, and top-k indices
+            Selected prompt embeddings
         """
         # Calculate similarity between query and prompts
         similarity = torch.matmul(query_embedding, self.prompts.T) / self.temperature
@@ -48,6 +42,7 @@ class PromptBank(nn.Module):
         
         return selected_prompts, attention, top_k_indices
 
+
 class PromptBaseSASRec(SASRec):
     """
     Extends SASRec model with prompt-based incremental learning
@@ -60,7 +55,10 @@ class PromptBaseSASRec(SASRec):
         self.num_prompts = getattr(args, 'num_prompts', 8)
         
         # Create prompt bank
-        self.prompt_bank = PromptBank(prompt_dim, self.num_prompts, initial_prompts)
+        self.prompt_bank = PromptBank(prompt_dim, self.num_prompts)#, initial_prompts)
+        
+        # For tracking which prompts should be frozen
+        self.frozen_prompt_indices = []
         
         # For tracking performance
         self.seen_items = set()
@@ -226,8 +224,6 @@ class PromptBaseSASRec(SASRec):
         
         return loss, attention_weights, auc, l2_loss
 
-
-
     def predict(self, u, seq, item_idx):
         """
         Make predictions with prompt enhancement
@@ -263,8 +259,10 @@ class PromptBaseSASRec(SASRec):
             batch_indices = torch.arange(batch_size).to(self.dev)
             query_vectors = seq_repr[batch_indices, valid_positions]
             
-            # Select prompts based on the sequence representation - update to handle 3 return values
-            selected_prompts, _, _ = self.prompt_bank(query_vectors, top_k=3)
+            # Select prompts based on the sequence representation
+            similarities = torch.matmul(query_vectors, self.prompt_bank.prompts.T) / self.prompt_bank.temperature
+            prompt_weights = F.softmax(similarities, dim=-1)
+            selected_prompts = torch.matmul(prompt_weights, self.prompt_bank.prompts)
             
             # Mask padding
             if mask is not None:
@@ -318,14 +316,16 @@ class PromptBaseSASRec(SASRec):
         self.train()
         
         return scores
-
-
+        
     def update_item_sets(self, old_items, new_items):
         """
         Update seen item sets for adaptive weighting
         """
         self.seen_items = set(old_items)
         self.new_items = set(new_items)
+
+
+
 
     def train_with_separate_prompt_phases(self, train_data, valid_data, test_data, args, device):
         """
@@ -341,21 +341,17 @@ class PromptBaseSASRec(SASRec):
                             threshold_item=args.threshold_item,
                             n_workers=3, device=device)
         
-        # Phase 1: Train base model with frozen prompts
-        print("=== Phase 1: Training base model with frozen prompts ===")
-        # Freeze prompt parameters
-        for param in self.prompt_bank.parameters():
-            param.requires_grad = False
-            
-        # Create optimizer for non-prompt parameters
-        phase1_optimizer = torch.optim.Adam(
-            [p for n, p in self.named_parameters() if 'prompt_bank' not in n],
-            lr=args.lr, betas=(0.9, 0.98)
-        )
+        # Phase 1: Train base model with minimal prompt influence
+        print("=== Phase 1: Training base model with minimal prompt influence ===")
         
-        # Disable prompt mixing during phase 1
+        # Store original prompt_mix_ratio
         original_mix_ratio = self.prompt_mix_ratio
-        self.prompt_mix_ratio = 0.0
+        
+        # Set a very low mix ratio for Phase 1
+        self.prompt_mix_ratio = 0.05  # Just enough to start learning prompt representations
+        
+        # Create optimizer for all parameters
+        phase1_optimizer = torch.optim.Adam(self.parameters(), lr=args.lr, betas=(0.9, 0.98))
         
         # Train for ~1/3 of the total epochs
         num_batch = max(len(train_data) // args.batch_size, 1)
@@ -375,19 +371,16 @@ class PromptBaseSASRec(SASRec):
                 t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 1 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
-        # Phase 2: Train prompts with frozen base model
-        print("=== Phase 2: Training prompts with frozen base model ===")
-        # Freeze non-prompt parameters
+        # Phase 2: Train prompts with a higher mix ratio while freezing base model
+        print("=== Phase 2: Freezing base model, training prompts ===")
+        
+        # Restore original prompt mixing
+        self.prompt_mix_ratio = original_mix_ratio
+        
+        # Freeze all non-prompt parameters
         for name, param in self.named_parameters():
             if 'prompt_bank' not in name:
                 param.requires_grad = False
-        
-        # Unfreeze prompt parameters
-        for param in self.prompt_bank.parameters():
-            param.requires_grad = True
-        
-        # Restore prompt mixing
-        self.prompt_mix_ratio = original_mix_ratio
         
         # Create optimizer for prompt parameters only
         phase2_optimizer = torch.optim.Adam(
@@ -414,6 +407,7 @@ class PromptBaseSASRec(SASRec):
         
         # Phase 3: Fine-tune everything together
         print("=== Phase 3: Fine-tuning entire model with prompts ===")
+        
         # Unfreeze all parameters
         for param in self.parameters():
             param.requires_grad = True
@@ -441,13 +435,9 @@ class PromptBaseSASRec(SASRec):
                 t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
                 print(f"[Phase 3 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
-            # After Phase 3 is complete (all training phases on T1)
-        print("=== Freezing prompts after initial training ===")
-        for param in self.prompt_bank.parameters():
-            param.requires_grad = False
-
         # Close sampler
         t1_sampler.close()
+
 
 
     def train_two_phase(self, train_data, valid_data, args, device, num_epochs=None):
@@ -529,6 +519,7 @@ class PromptBaseSASRec(SASRec):
         # Close sampler
         sampler.close()
 
+
     def generate_new_prompts(self, slice_data, num_new_prompts=4, device='cuda'):
         """Generate new prompts from current slice data patterns"""
         print(f"Generating {num_new_prompts} new prompts from current slice data")
@@ -594,22 +585,25 @@ class PromptBaseSASRec(SASRec):
             # Not enough samples, just use what we have
             new_prompts = torch.tensor(np.array(sequence_reprs), dtype=torch.float32, device=device)
         
-        # Add new prompts to the prompt bank
-        current_prompts = self.prompt_bank.prompts.data
+        # Store the current prompts
+        current_prompts = self.prompt_bank.prompts.detach().clone()
+        
+        # Create a new prompt bank with the combined prompts
         combined_prompts = torch.cat([current_prompts, new_prompts])
         
-        # Update prompt bank
-        self.prompt_bank.prompts = nn.Parameter(combined_prompts)
-        self.num_prompts = combined_prompts.size(0)
+        # Create a completely new Parameter for the prompt bank
+        old_prompt_count = current_prompts.size(0)
+        new_prompt_count = combined_prompts.size(0)
+        
+        # Replace the entire prompts parameter
+        self.prompt_bank.prompts = torch.nn.Parameter(combined_prompts)
+        self.num_prompts = new_prompt_count
         
         print(f"Prompt bank expanded to {self.num_prompts} prompts")
         
-        # Set the new prompts as trainable
-        # Only the newly added prompts will be trainable if we maintain hybrid freezing
-        old_prompt_count = current_prompts.size(0)
-        for i in range(old_prompt_count, self.num_prompts):
-            self.prompt_bank.prompts[i].requires_grad = True
-            
+        # Handle hybrid freezing through gradient masking in forward pass
+        # instead of trying to set requires_grad on individual tensor elements
+        
         return self.num_prompts
 
 
@@ -665,3 +659,56 @@ class PromptBaseSASRec(SASRec):
         
         sampler.close()
         return prompt_usage
+    
+
+
+    def setup_prompt_gradient_masking(self, frozen_indices):
+        """
+        Set up a hook for gradient masking to implement hybrid prompt freezing
+        
+        Args:
+            frozen_indices: List of prompt indices to freeze
+        """
+        # Create a mask for the prompts parameter
+        self.frozen_prompt_indices = frozen_indices
+        
+        # Remove existing hooks if any
+        if hasattr(self, '_prompt_grad_hook'):
+            self._prompt_grad_hook.remove()
+        
+        # Register the hook
+        self._prompt_grad_hook = self.prompt_bank.prompts.register_hook(self.mask_prompt_grads)
+        
+        print(f"Gradient masking set up: {len(frozen_indices)} prompts frozen, "
+            f"{self.num_prompts - len(frozen_indices)} prompts trainable")
+        
+        return True
+    
+    # Define the hook function
+    def mask_prompt_grads(self, grad):
+        # Create a mask initialized with ones (all prompts trainable by default)
+        mask = torch.ones_like(grad)
+        
+        # Set mask to zero for prompts that should be frozen
+        for idx in self.frozen_prompt_indices:
+            if idx < grad.size(0):
+                mask[idx] = 0.0
+                
+        # Apply the mask to zero out gradients for frozen prompts
+        return grad * mask
+    
+    def ensure_hybrid_prompt_freezing(self):
+        """
+        Ensure hybrid prompt freezing during incremental learning
+        """
+        print("=== Ensuring hybrid prompt freezing during incremental learning ===")
+        
+        # Determine which prompts to freeze (memory prompts)
+        # For example, freeze the first 16 prompts (or all if fewer than 16)
+        frozen_count = min(16, self.num_prompts)
+        frozen_indices = list(range(frozen_count))
+        
+        # Set up gradient masking for these prompts
+        self.setup_prompt_gradient_masking(frozen_indices)
+        
+        return frozen_indices

@@ -8,19 +8,17 @@ import random
 import argparse
 from sampler import WarpSampler
 from model_v1 import SASRec
-from util import *
+from util import evaluate, evaluate_valid, data_partition
 
 # Import incremental learning components
-from incremental_model import IncrementalSASRec
+from incremental_model import IncrementalSASRec, JointSASRec
 from incremental_data import TimeSlicedData, ExperienceReplay
 from eval_incremental import evaluate_incremental, evaluate_forgetting
 
 # Import prompt-based components
-from prompt_model import PromptBaseSASRec
+from prompt_model import PromptBaseSASRec, PromptBank #, setup_prompt_gradient_masking, ensure_hybrid_prompt_freezing, generate_new_prompts
 from prompt_manager import PromptManager
-# Add this to your existing imports
-from prompt_extractor import PromptExtractor, create_data_loader, analyze_prompt_diversity, evaluate_prompts
-# Use the original argument parser and extend it with prompt-related arguments
+
 parser = argparse.ArgumentParser()
 # Original arguments
 parser.add_argument('--dataset', default='ml1m')
@@ -445,24 +443,12 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     
     # Implement hybrid prompt freezing strategy
     print("=== Implementing hybrid prompt freezing strategy ===")
-    # Calculate prompt importance based on usage
-    prompt_usage = prompt_model.analyze_prompt_usage(t1_user_train, args, device)
+    # # Add the new methods to the model instance
+    # prompt_model.setup_prompt_gradient_masking = setup_prompt_gradient_masking.__get__(prompt_model)
+    # prompt_model.ensure_hybrid_prompt_freezing = ensure_hybrid_prompt_freezing.__get__(prompt_model)
     
-    # Sort prompts by importance/usage
-    prompt_importance = torch.tensor(prompt_usage)
-    _, sorted_indices = torch.sort(prompt_importance, descending=True)
-    
-    # Freeze the top 16 most important prompts (memory prompts)
-    frozen_count = min(16, prompt_model.num_prompts)
-    for i in range(prompt_model.num_prompts):
-        if i in sorted_indices[:frozen_count]:
-            # Freeze this prompt
-            prompt_model.prompt_bank.prompts[i].requires_grad = False
-            print(f"Prompt {i} frozen (memory prompt)")
-        else:
-            # Keep this prompt trainable
-            prompt_model.prompt_bank.prompts[i].requires_grad = True
-            print(f"Prompt {i} remains trainable (adaptive prompt)")
+    # Apply the hybrid freezing
+    prompt_model.ensure_hybrid_prompt_freezing()
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
@@ -510,14 +496,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         print(f"\n=== Prompt-Based Incremental Learning on Slice {slice_idx} ===")
         
         # Ensure hybrid prompt freezing during incremental learning
-        print("=== Ensuring hybrid prompt freezing during incremental learning ===")
-        for i in range(prompt_model.num_prompts):
-            if i < 16:  # First 16 prompts are memory prompts
-                for param in [p for n, p in prompt_model.named_parameters() if f'prompt_bank.prompts.{i}' in n]:
-                    param.requires_grad = False
-            else:
-                for param in [p for n, p in prompt_model.named_parameters() if f'prompt_bank.prompts.{i}' in n]:
-                    param.requires_grad = True
+        prompt_model.ensure_hybrid_prompt_freezing()
         
         # Get slice data
         slice_data = time_data.prepare_slice(slice_idx, include_previous=False)
@@ -525,9 +504,14 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         
         # Generate new prompts from current slice
         if slice_idx > 1:  # After the first incremental update
+            # Add the new method to the model instance
+            # prompt_model.generate_new_prompts = generate_new_prompts.__get__(prompt_model)
+            
             # Generate new prompts from current slice
             new_prompt_count = prompt_model.generate_new_prompts(slice_data, num_new_prompts=4, device=device)
-            print(f"Prompt bank now has {new_prompt_count} prompts ({new_prompt_count-24} new prompts)")
+            
+            # Re-apply hybrid freezing after adding new prompts
+            prompt_model.ensure_hybrid_prompt_freezing()
         
         # Get slice items
         slice_users, slice_items = time_data.get_slice_data(slice_idx)
@@ -543,11 +527,9 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                                   threshold_item=args.threshold_item,
                                   n_workers=3, device=device)
         
-        # Create optimizer with lower learning rate - EXCLUDE FROZEN PROMPT PARAMETERS
+        # Create optimizer - all parameters are included, but gradients will be masked for frozen prompts
         inc_lr = args.lr * 0.1  # Lower learning rate for stability
-        optimizer_params = [p for n, p in prompt_model.named_parameters() 
-                           if not ('prompt_bank.prompts' in n and not p.requires_grad)]
-        inc_optimizer = torch.optim.Adam(optimizer_params, lr=inc_lr, betas=(0.9, 0.98))
+        inc_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=inc_lr, betas=(0.9, 0.98))
         
         # Create new replay buffer for this slice
         slice_buffer = time_data.create_replay_buffer(slice_idx, args.buffer_size, max_seq_length=1)
@@ -624,11 +606,6 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=None)
                 loss.backward()
                 inc_optimizer.step()
-                
-                # Double-check prompts remain frozen during training
-                for i in range(min(16, prompt_model.num_prompts)):
-                    if prompt_model.prompt_bank.prompts[i].grad is not None:
-                        prompt_model.prompt_bank.prompts[i].grad.zero_()
             
             if epoch % args.print_freq == 0:
                 t1 = time.time() - t0
