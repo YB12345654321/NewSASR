@@ -24,56 +24,60 @@ class IncrementalSASRec(SASRec):
         # For tracking performance
         self.seen_items = set()
         self.new_items = set()
-    
-    def forward(self, u, seq, pos, neg, is_training=True, base_model=None):
-            """
-            Forward pass with optional knowledge distillation
-            """
-            loss, attention_weights, auc, l2_loss = super().forward(
-                u, seq, pos, neg, is_training=is_training)
-            
-            # Add knowledge distillation if base model is provided and in training mode
 
-            if is_training and base_model is not None:
-                # Get base model predictions
-                with torch.no_grad():
-                    try:
-                        # Ensure inputs are properly typed for the base model
-                        # Convert to the correct device and dtype consistently
-                        u_tensor = u.to(self.dev).long()
-                        seq_tensor = seq.to(self.dev).long()
-                        pos_tensor = pos.reshape(-1).to(self.dev).long()  # Ensure it's flattened as the model expects
-                        neg_tensor = neg.reshape(-1).to(self.dev).long()  # Ensure it's flattened as the model expects
+
+
+    def forward(self, u, seq, pos, neg, is_training=True, base_model=None):
+        """
+        Forward pass with optional knowledge distillation
+        """
+        # Check if we have prompt functionality
+        has_prompts = hasattr(self, 'prompt_bank')
+        
+        # Standard processing
+        loss, attention_weights, auc, l2_loss = super().forward(
+            u, seq, pos, neg, is_training=is_training)
+        
+        # Add knowledge distillation if base model is provided and in training mode
+        if is_training and base_model is not None:
+            # Get base model predictions
+            with torch.no_grad():
+                try:
+                    # Ensure inputs are properly typed for the base model
+                    u_tensor = u.to(self.dev).long()
+                    seq_tensor = seq.to(self.dev).long()
+                    pos_tensor = pos.reshape(-1).to(self.dev).long()
+                    neg_tensor = neg.reshape(-1).to(self.dev).long()
+                    
+                    # Run the base model with properly prepared inputs
+                    base_output = base_model(u_tensor, seq_tensor, pos_tensor, neg_tensor, is_training=False)
+                    base_attention = base_output[1][0]  # Get attention weights
+                    
+                    # Knowledge distillation loss on attention weights
+                    distill_temp = getattr(self.args, 'distill_temp', 2.0)
+                    distill_alpha = getattr(self.args, 'distill_alpha', 0.5)
+                    
+                    # Match dimensions for KL divergence
+                    if attention_weights[0].shape == base_attention.shape:
+                        distill_loss = F.kl_div(
+                            F.log_softmax(attention_weights[0] / distill_temp, dim=-1),
+                            F.softmax(base_attention / distill_temp, dim=-1),
+                            reduction='batchmean'
+                        )
                         
-                        # Run the base model with properly prepared inputs
-                        base_output = base_model(u_tensor, seq_tensor, pos_tensor, neg_tensor, is_training=False)
-                        base_attention = base_output[1][0]  # Get attention weights
+                        loss += distill_alpha * distill_loss
+                    else:
+                        print(f"Warning: Attention shape mismatch. Current: {attention_weights[0].shape}, Base: {base_attention.shape}")
                         
-                        # Knowledge distillation loss on attention weights
-                        distill_temp = getattr(self.args, 'distill_temp', 2.0)
-                        distill_alpha = getattr(self.args, 'distill_alpha', 0.5)
+                except Exception as e:
+                    print(f"Error during knowledge distillation: {e}")
+                    # Continue without distillation if it fails
+                    pass
                         
-                        # Match dimensions for KL divergence
-                        # Make sure we're comparing attention weights of the same shape
-                        if attention_weights[0].shape == base_attention.shape:
-                            distill_loss = F.kl_div(
-                                F.log_softmax(attention_weights[0] / distill_temp, dim=-1),
-                                F.softmax(base_attention / distill_temp, dim=-1),
-                                reduction='batchmean'
-                            )
-                            
-                            loss += distill_alpha * distill_loss
-                        else:
-                            print(f"Warning: Attention shape mismatch. Current: {attention_weights[0].shape}, Base: {base_attention.shape}")
-                            
-                    except Exception as e:
-                        print(f"Error during knowledge distillation: {e}")
-                        # Continue without distillation if it fails
-                        pass
-                        
-            # Return the updated loss and other values
-            return loss, attention_weights, auc, l2_loss
-    
+        # Return the updated loss and other values
+        return loss, attention_weights, auc, l2_loss
+
+
     def update_item_sets(self, old_items, new_items):
         """
         Update seen item sets for adaptive weighting

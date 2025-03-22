@@ -28,10 +28,10 @@ class PromptManager:
         self.old_items = set(old_items)
         self.new_items = set(new_items)
         self.prompt_model.update_item_sets(old_items, new_items)
-        
     def analyze_prompts(self, dataset, args, device):
         """
         Analyze how prompts are used for different users/items
+        Enhanced to track top-K prompt usage
         
         Args:
             dataset: Dataset to analyze
@@ -45,6 +45,7 @@ class PromptManager:
         
         results = {
             'prompt_usage': {},
+            'top_k_selections': {},
             'item_type_usage': {
                 'old_items': {},
                 'new_items': {},
@@ -62,9 +63,15 @@ class PromptManager:
             
         # Track prompt usage (on the right device)
         prompt_usage = torch.zeros(self.num_prompts, device=device)
+        top_k_selections = torch.zeros(self.num_prompts, device=device)
+        
+        # Track usage by item type
         old_item_usage = torch.zeros(self.num_prompts, device=device)
         new_item_usage = torch.zeros(self.num_prompts, device=device)
         unseen_item_usage = torch.zeros(self.num_prompts, device=device)
+        
+        # Track co-occurrence of prompts (how often are they selected together)
+        prompt_cooccurrence = torch.zeros(self.num_prompts, self.num_prompts, device=device)
         
         total_old = 0
         total_new = 0
@@ -115,10 +122,19 @@ class PromptManager:
                 query_vectors = seq_repr[batch_indices, valid_positions]
                 
                 # Select prompts based on the sequence representation
-                _, prompt_weights = self.prompt_model.prompt_bank(query_vectors)
+                _, prompt_weights, top_k_indices = self.prompt_model.prompt_bank(query_vectors, top_k=3)
                 
                 # Update overall prompt usage
                 prompt_usage += prompt_weights.squeeze(0)
+                
+                # Update top-k selection count
+                for idx in top_k_indices.squeeze(0):
+                    top_k_selections[idx] += 1
+                    
+                # Update co-occurrence matrix
+                for i in top_k_indices.squeeze(0):
+                    for j in top_k_indices.squeeze(0):
+                        prompt_cooccurrence[i, j] += 1
                 
                 # Analyze usage patterns for different item types
                 for i in seq.squeeze().cpu().numpy():
@@ -139,6 +155,9 @@ class PromptManager:
         if torch.sum(prompt_usage) > 0:
             prompt_usage = prompt_usage / torch.sum(prompt_usage)
         
+        if torch.sum(top_k_selections) > 0:
+            top_k_selections = top_k_selections / torch.sum(top_k_selections)
+        
         if total_old > 0:
             old_item_usage = old_item_usage / total_old
         
@@ -148,11 +167,42 @@ class PromptManager:
         if total_unseen > 0:
             unseen_item_usage = unseen_item_usage / total_unseen
         
+        # Normalize co-occurrence matrix
+        total_selections = prompt_cooccurrence.sum() / self.num_prompts  # Account for self-selection
+        if total_selections > 0:
+            prompt_cooccurrence = prompt_cooccurrence / total_selections
+        
+        # Calculate prompt specialization scores
+        # Higher score means the prompt tends to be used for specific item types
+        prompt_specialization = torch.zeros(self.num_prompts, device=device)
+        if total_old > 0 and total_new > 0:
+            for i in range(self.num_prompts):
+                # Calculate how differently this prompt is used for old vs new items
+                specialization = torch.abs(old_item_usage[i] - new_item_usage[i])
+                prompt_specialization[i] = specialization
+        
         # Store results (convert to numpy for storage)
         results['prompt_usage'] = prompt_usage.cpu().numpy()
+        results['top_k_selections'] = top_k_selections.cpu().numpy()
+        results['prompt_cooccurrence'] = prompt_cooccurrence.cpu().numpy()
+        results['prompt_specialization'] = prompt_specialization.cpu().numpy()
         results['item_type_usage']['old_items'] = old_item_usage.cpu().numpy()
         results['item_type_usage']['new_items'] = new_item_usage.cpu().numpy()
         results['item_type_usage']['unseen_items'] = unseen_item_usage.cpu().numpy()
+        
+        # Calculate specialized roles based on usage patterns
+        roles = []
+        for i in range(self.num_prompts):
+            if old_item_usage[i] > new_item_usage[i] * 1.5:
+                roles.append("Old Items Specialist")
+            elif new_item_usage[i] > old_item_usage[i] * 1.5:
+                roles.append("New Items Specialist")
+            elif unseen_item_usage[i] > (old_item_usage[i] + new_item_usage[i]) / 2 * 1.5:
+                roles.append("Exploration Specialist")
+            else:
+                roles.append("General Purpose")
+        
+        results['prompt_roles'] = roles
         
         self.prompt_model.train()
         return results

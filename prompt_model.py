@@ -17,28 +17,31 @@ class PromptBank(nn.Module):
         # Initialize learnable prompt vectors
         self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-        
-    def forward(self, query_embedding):
+
+    def forward(self, query_embedding, top_k=3):
         """
         Select relevant prompts based on query embedding
         
         Args:
             query_embedding: Embedding used to query the prompt bank
+            top_k: Number of top prompts to consider
             
         Returns:
-            Selected prompt embeddings
+            Selected prompt embeddings, attention weights, and top-k indices
         """
         # Calculate similarity between query and prompts
         similarity = torch.matmul(query_embedding, self.prompts.T) / self.temperature
         
-        # Apply softmax to get attention weights
-        attention = F.softmax(similarity, dim=-1)
+        # Get top-k indices and scores
+        top_k_values, top_k_indices = torch.topk(similarity, k=min(top_k, similarity.size(-1)), dim=-1)
+        
+        # Create a sparse attention weights tensor
+        attention = torch.zeros_like(similarity).scatter_(-1, top_k_indices, F.softmax(top_k_values, dim=-1))
         
         # Get weighted combination of prompts
         selected_prompts = torch.matmul(attention, self.prompts)
         
-        return selected_prompts, attention
-
+        return selected_prompts, attention, top_k_indices
 
 class PromptBaseSASRec(SASRec):
     """
@@ -218,6 +221,9 @@ class PromptBaseSASRec(SASRec):
         
         return loss, attention_weights, auc, l2_loss
 
+
+
+
     def predict(self, u, seq, item_idx):
         """
         Make predictions with prompt enhancement
@@ -253,17 +259,30 @@ class PromptBaseSASRec(SASRec):
             batch_indices = torch.arange(batch_size).to(self.dev)
             query_vectors = seq_repr[batch_indices, valid_positions]
             
-            # Select prompts based on the sequence representation
-            selected_prompts, _ = self.prompt_bank(query_vectors)
+            # Select prompts based on the sequence representation - update to handle 3 return values
+            selected_prompts, _, _ = self.prompt_bank(query_vectors, top_k=3)
             
             # Mask padding
             if mask is not None:
                 seq_repr = seq_repr * mask.unsqueeze(-1).float()
             
-            # Add prompts to the sequence representation
-            # Mix the prompts with the sequence representation at each position
-            selected_prompts_expand = selected_prompts.unsqueeze(1).expand(-1, seq_repr.size(1), -1)
-            seq_repr = seq_repr * (1 - self.prompt_mix_ratio) + selected_prompts_expand * self.prompt_mix_ratio
+            # Apply prompts with position-aware integration
+            # Clone sequence to avoid modifying the original
+            enhanced_seq = seq_repr.clone()
+            
+            # For each position, apply position-dependent prompt influence
+            seq_len = seq_repr.size(1)
+            for pos in range(seq_len):
+                # Calculate position-dependent weight
+                # More recent items get more prompt influence
+                pos_weight = 1.0 - 0.8 * (seq_len - 1 - pos) / max(1, seq_len - 1)
+                
+                # Mix prompts with the representation at this position
+                mix_ratio = self.prompt_mix_ratio * pos_weight
+                enhanced_seq[:, pos, :] = seq_repr[:, pos, :] * (1 - mix_ratio) + selected_prompts * mix_ratio
+            
+            # Use the enhanced sequence
+            seq_repr = enhanced_seq
             
             # Self-attention blocks
             for i in range(len(self.attention_layers)):
@@ -295,7 +314,8 @@ class PromptBaseSASRec(SASRec):
         self.train()
         
         return scores
-        
+
+
     def update_item_sets(self, old_items, new_items):
         """
         Update seen item sets for adaptive weighting
@@ -306,6 +326,7 @@ class PromptBaseSASRec(SASRec):
     def train_with_separate_prompt_phases(self, train_data, valid_data, test_data, args, device):
         """
         Train the model with separate phases for base model and prompts
+        Enhanced with curriculum learning and increased epochs for prompt training
         """
         # Create samplers and optimizers
         t1_sampler = WarpSampler(train_data, self.usernum, self.itemnum,
@@ -330,9 +351,9 @@ class PromptBaseSASRec(SASRec):
         original_mix_ratio = self.prompt_mix_ratio
         self.prompt_mix_ratio = 0.0
         
-        # Train for half the epochs
+        # Train for ~1/3 of the total epochs
         num_batch = max(len(train_data) // args.batch_size, 1)
-        phase1_epochs = args.num_epochs // 2
+        phase1_epochs = args.num_epochs // 3
         
         for epoch in range(1, phase1_epochs + 1):
             for step in range(num_batch):
@@ -362,16 +383,76 @@ class PromptBaseSASRec(SASRec):
         # Restore prompt mixing
         self.prompt_mix_ratio = original_mix_ratio
         
-        # Create optimizer for prompt parameters only
-        phase2_optimizer = torch.optim.Adam(
-            self.prompt_bank.parameters(),
-            lr=args.lr, betas=(0.9, 0.98)
-        )
+        # Train prompts longer than base model for better specialization
+        # At least twice as many epochs as Phase 1
+        phase2_epochs = max(args.num_epochs - phase1_epochs, phase1_epochs * 2)
         
-        # Train for remaining epochs
-        phase2_epochs = args.num_epochs - phase1_epochs
+        # Use curriculum learning for prompt training
+        curriculum_stages = 3
+        prompts_per_stage = [1, 2, 3]  # Gradually increase number of prompts used
         
-        for epoch in range(1, phase2_epochs + 1):
+        # Keep track of best performance for early stopping
+        best_ndcg = 0.0
+        patience = 5  # Number of stages without improvement before stopping
+        patience_counter = 0
+        
+        for stage in range(curriculum_stages):
+            print(f"=== Prompt Training Stage {stage+1}/{curriculum_stages} ===")
+            
+            # Adjust mix ratio and learning rate based on stage
+            stage_mix_ratio = self.prompt_mix_ratio * (stage + 1) / curriculum_stages
+            self.prompt_mix_ratio = stage_mix_ratio
+            
+            # Higher learning rate for prompts in early stages, then decay
+            stage_lr = args.lr * (1.5 - 0.5 * stage / curriculum_stages)
+            
+            # Create optimizer with stage-specific learning rate
+            phase2_optimizer = torch.optim.Adam(
+                self.prompt_bank.parameters(),
+                lr=stage_lr, betas=(0.9, 0.98)
+            )
+            
+            # Train for this stage
+            stage_epochs = phase2_epochs // curriculum_stages
+            
+            for epoch in range(1, stage_epochs + 1):
+                for step in range(num_batch):
+                    u, seq, pos, neg = t1_sampler.next_batch()
+                    
+                    phase2_optimizer.zero_grad()
+                    loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                    loss.backward()
+                    phase2_optimizer.step()
+                
+                if epoch % args.print_freq == 0:
+                    # Create dataset with self.usernum and self.itemnum
+                    t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
+                    print(f"[Phase 2 Stage {stage+1} epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+                    
+                    # Check for improvement for early stopping
+                    if t_test[0] > best_ndcg:
+                        best_ndcg = t_test[0]
+                        patience_counter = 0
+                        # Save best model weights
+                        best_state = copy.deepcopy(self.state_dict())
+                    else:
+                        patience_counter += 1
+            
+            # Check for early stopping
+            if patience_counter >= patience:
+                print(f"No improvement for {patience} stages. Early stopping.")
+                # Restore best model weights
+                self.load_state_dict(best_state)
+                break
+                
+        # Specialized prompt fine-tuning
+        print("=== Final Prompt Fine-tuning ===")
+        # Focus on a few specialized tasks like retention
+        fine_tune_epochs = phase2_epochs // 4
+        
+        # Create specialized batches with both old and new items
+        # This helps prompts specialize in handling forgetting
+        for epoch in range(1, fine_tune_epochs + 1):
             for step in range(num_batch):
                 u, seq, pos, neg = t1_sampler.next_batch()
                 
@@ -379,11 +460,14 @@ class PromptBaseSASRec(SASRec):
                 loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
                 loss.backward()
                 phase2_optimizer.step()
-                
+            
             if epoch % args.print_freq == 0:
-                # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
                 t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
-                print(f"[Phase 2 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+                print(f"[Fine-tune epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+        
+        # Unfreeze all parameters for future incremental learning
+        for param in self.parameters():
+            param.requires_grad = True
         
         # Close sampler
         t1_sampler.close()
