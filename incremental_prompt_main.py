@@ -18,7 +18,8 @@ from eval_incremental import evaluate_incremental, evaluate_forgetting
 # Import prompt-based components
 from prompt_model import PromptBaseSASRec
 from prompt_manager import PromptManager
-
+# Add this to your existing imports
+from prompt_extractor import PromptExtractor, create_data_loader, analyze_prompt_diversity, evaluate_prompts
 # Use the original argument parser and extend it with prompt-related arguments
 parser = argparse.ArgumentParser()
 # Original arguments
@@ -56,7 +57,9 @@ parser.add_argument('--save_splits', action='store_true', help='Whether to save 
 parser.add_argument('--num_prompts', default=8, type=int, help='Number of prompts in the bank')
 parser.add_argument('--prompt_mix_ratio', default=0.3, type=float, help='Mixing ratio for prompts')
 parser.add_argument('--run_both', action='store_true', help='Run both regular incremental and prompt-based models')
-
+parser.add_argument('--extract_prompts', action='store_true', help='Extract prompts from transformer layers')
+parser.add_argument('--prompt_layer_idx', default=0, type=int, help='Layer index to extract prompts from')
+parser.add_argument('--freeze_prompts', action='store_true', help='Freeze prompts after initial training')
 def set_seed(seed):
     """
     Set random seed for reproducibility
@@ -401,10 +404,27 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     
     return results, base_model, t1_items
 
+
+def freeze_prompts(model, freeze=True):
+    """
+    Freeze or unfreeze prompts
+    
+    Args:
+        model: Model with prompt_bank
+        freeze: Whether to freeze (True) or unfreeze (False)
+    """
+    for param in model.prompt_bank.parameters():
+        param.requires_grad = not freeze
+    
+    if freeze:
+        print("Prompts are now frozen")
+    else:
+        print("Prompts are now trainable")
+
+
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
-    Run prompt-based incremental learning experiment with two-phase training
-    and diversity loss
+    Run prompt-based incremental learning with prompts extracted from transformer
     """
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -413,15 +433,77 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     t1_data = time_data.prepare_slice(0, include_previous=False)
     [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum] = t1_data
     
-    # Initialize prompt-based model
+    # First, train a base model without prompts if extract_prompts is enabled
+    initial_prompts = None
+    if args.extract_prompts:
+        print("\n=== Training Base Transformer Model for Prompt Extraction ===")
+        base_transformer = SASRec(usernum, itemnum, args).to(device)
+        
+        # Create data loader for training
+        data_loader, sampler = create_data_loader(t1_user_train, usernum, itemnum, args, device)
+        
+        # Train base transformer model
+        optimizer = torch.optim.Adam(base_transformer.parameters(), lr=args.lr, betas=(0.9, 0.98))
+        
+        # Train for half the epochs
+        base_epochs = args.num_epochs // 2
+        
+        for epoch in range(1, base_epochs + 1):
+            base_transformer.train()
+            running_loss = 0.0
+            num_batches = 0
+            
+            for u, seq, pos, neg in data_loader:
+                optimizer.zero_grad()
+                loss, _, _, _ = base_transformer(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+                num_batches += 1
+            
+            if epoch % args.print_freq == 0:
+                avg_loss = running_loss / num_batches
+                print(f"[Base transformer epoch {epoch}] Loss={avg_loss:.4f}")
+                running_loss = 0.0
+        
+        # Extract prompts from the transformer layers
+        print("\n=== Extracting Prompts from Transformer Layers ===")
+        extractor = PromptExtractor(base_transformer, layer_idx=args.prompt_layer_idx)
+        initial_prompts = extractor.generate_prompts(data_loader, num_prompts=args.num_prompts)
+        
+        # Save the extracted prompts
+        prompts_path = os.path.join(output_dir, 'extracted_prompts.pt')
+        torch.save(initial_prompts, prompts_path)
+        print(f"Extracted prompts saved to {prompts_path}")
+        
+        # Analyze prompt diversity
+        prompt_diversity = analyze_prompt_diversity(initial_prompts.to(device))
+        log_file.write(f"Prompt diversity metrics: {prompt_diversity}\n")
+        print(f"Prompt diversity metrics: {prompt_diversity}")
+        
+        # Move prompts to the correct device
+        initial_prompts = initial_prompts.to(device)
+        
+        # Clean up
+        del base_transformer
+        sampler.close()
+        torch.cuda.empty_cache()
+    
+    # Initialize prompt-based model with extracted prompts
     print("\n=== Training Prompt-Based Model on T1 ===")
-    prompt_model = PromptBaseSASRec(usernum, itemnum, args).to(device)
+    prompt_model = PromptBaseSASRec(usernum, itemnum, args, initial_prompts=initial_prompts).to(device)
 
     # Initialize prompt manager
     prompt_manager = PromptManager(prompt_model, args.num_prompts)
 
-    # Use two-phase training for T1 (match the method name in prompt_model.py)
+    # Use two-phase training for T1
     prompt_model.train_with_separate_prompt_phases(t1_user_train, t1_user_valid, t1_user_test, args, device)
+    
+    # Evaluate prompts contribution if desired
+    if args.extract_prompts:
+        ndcg_contrib, hr_contrib = evaluate_prompts(prompt_model, [t1_user_train, t1_user_valid, t1_user_test, usernum, itemnum], args, device)
+        log_file.write(f"Prompt contribution: NDCG +{ndcg_contrib:.4f}, HR +{hr_contrib:.4f}\n")
+        print(f"Prompt contribution: NDCG +{ndcg_contrib:.4f}, HR +{hr_contrib:.4f}")
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
@@ -456,6 +538,10 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         else:
             results['prompt_model'][f'slice_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
             print(f"Prompt-based model on slice {i}: No valid test users found. Skipping.")
+    
+    # Optionally freeze prompts for incremental learning
+    if args.freeze_prompts:
+        freeze_prompts(prompt_model, True)
     
     # Create replay buffer
     replay_buffer = ExperienceReplay(args.buffer_size, args.replay_ratio)
@@ -561,9 +647,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                         neg = torch.cat([neg, r_negs_tensor])
                 
                 # Update model without knowledge distillation from base model
-                # Change: pass None instead of base_model to disable knowledge distillation
                 inc_optimizer.zero_grad()
-# We're passing None instead of base_model to disable knowledge distillation
                 loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=None)
                 loss.backward()
                 inc_optimizer.step()
@@ -613,6 +697,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     print("\n=== Prompt-Based Incremental Learning Experiment Completed ===")
     
     return results
+
 
 def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
     """
@@ -857,6 +942,7 @@ def generate_detailed_comparison(results_incremental, results_prompt, args, outp
     with open(os.path.join(output_dir, 'retention_vs_acquisition_summary.txt'), 'w') as f:
         f.write(retention_table)
 
+
 def main():
     args = parser.parse_args()
     
@@ -945,6 +1031,7 @@ def main():
             f.close()
             sampler.close()
             print("Done")
+
 
 if __name__ == "__main__":
     main()

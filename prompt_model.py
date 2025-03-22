@@ -12,12 +12,17 @@ class PromptBank(nn.Module):
     """
     A bank of learnable prompts that capture different user behavior patterns
     """
-    def __init__(self, prompt_dim, num_prompts=8):
+    def __init__(self, prompt_dim, num_prompts=8, initial_prompts=None):
         super(PromptBank, self).__init__()
-        # Initialize learnable prompt vectors
-        self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
+        
+        # Initialize prompts - either with provided values or randomly
+        if initial_prompts is not None:
+            self.prompts = nn.Parameter(initial_prompts)
+        else:
+            self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
+            
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-
+        
     def forward(self, query_embedding, top_k=3):
         """
         Select relevant prompts based on query embedding
@@ -47,7 +52,7 @@ class PromptBaseSASRec(SASRec):
     """
     Extends SASRec model with prompt-based incremental learning
     """
-    def __init__(self, usernum, itemnum, args):
+    def __init__(self, usernum, itemnum, args, initial_prompts=None):
         super(PromptBaseSASRec, self).__init__(usernum, itemnum, args)
         
         # Define prompt dimensions
@@ -55,7 +60,7 @@ class PromptBaseSASRec(SASRec):
         self.num_prompts = getattr(args, 'num_prompts', 8)
         
         # Create prompt bank
-        self.prompt_bank = PromptBank(prompt_dim, self.num_prompts)
+        self.prompt_bank = PromptBank(prompt_dim, self.num_prompts, initial_prompts)
         
         # For tracking performance
         self.seen_items = set()
@@ -223,7 +228,6 @@ class PromptBaseSASRec(SASRec):
 
 
 
-
     def predict(self, u, seq, item_idx):
         """
         Make predictions with prompt enhancement
@@ -325,10 +329,12 @@ class PromptBaseSASRec(SASRec):
 
     def train_with_separate_prompt_phases(self, train_data, valid_data, test_data, args, device):
         """
-        Train the model with separate phases for base model and prompts
-        Enhanced with curriculum learning and increased epochs for prompt training
+        Enhanced three-phase training approach:
+        1. Train base model with frozen prompts
+        2. Train prompts with frozen base model
+        3. Fine-tune everything together
         """
-        # Create samplers and optimizers
+        # Create sampler
         t1_sampler = WarpSampler(train_data, self.usernum, self.itemnum,
                             batch_size=args.batch_size, maxlen=args.maxlen,
                             threshold_user=args.threshold_user,
@@ -383,76 +389,16 @@ class PromptBaseSASRec(SASRec):
         # Restore prompt mixing
         self.prompt_mix_ratio = original_mix_ratio
         
-        # Train prompts longer than base model for better specialization
-        # At least twice as many epochs as Phase 1
-        phase2_epochs = max(args.num_epochs - phase1_epochs, phase1_epochs * 2)
+        # Create optimizer for prompt parameters only
+        phase2_optimizer = torch.optim.Adam(
+            self.prompt_bank.parameters(),
+            lr=args.lr, betas=(0.9, 0.98)
+        )
         
-        # Use curriculum learning for prompt training
-        curriculum_stages = 3
-        prompts_per_stage = [1, 2, 3]  # Gradually increase number of prompts used
+        # Train for ~1/3 of the total epochs
+        phase2_epochs = args.num_epochs // 3
         
-        # Keep track of best performance for early stopping
-        best_ndcg = 0.0
-        patience = 5  # Number of stages without improvement before stopping
-        patience_counter = 0
-        
-        for stage in range(curriculum_stages):
-            print(f"=== Prompt Training Stage {stage+1}/{curriculum_stages} ===")
-            
-            # Adjust mix ratio and learning rate based on stage
-            stage_mix_ratio = self.prompt_mix_ratio * (stage + 1) / curriculum_stages
-            self.prompt_mix_ratio = stage_mix_ratio
-            
-            # Higher learning rate for prompts in early stages, then decay
-            stage_lr = args.lr * (1.5 - 0.5 * stage / curriculum_stages)
-            
-            # Create optimizer with stage-specific learning rate
-            phase2_optimizer = torch.optim.Adam(
-                self.prompt_bank.parameters(),
-                lr=stage_lr, betas=(0.9, 0.98)
-            )
-            
-            # Train for this stage
-            stage_epochs = phase2_epochs // curriculum_stages
-            
-            for epoch in range(1, stage_epochs + 1):
-                for step in range(num_batch):
-                    u, seq, pos, neg = t1_sampler.next_batch()
-                    
-                    phase2_optimizer.zero_grad()
-                    loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
-                    loss.backward()
-                    phase2_optimizer.step()
-                
-                if epoch % args.print_freq == 0:
-                    # Create dataset with self.usernum and self.itemnum
-                    t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
-                    print(f"[Phase 2 Stage {stage+1} epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
-                    
-                    # Check for improvement for early stopping
-                    if t_test[0] > best_ndcg:
-                        best_ndcg = t_test[0]
-                        patience_counter = 0
-                        # Save best model weights
-                        best_state = copy.deepcopy(self.state_dict())
-                    else:
-                        patience_counter += 1
-            
-            # Check for early stopping
-            if patience_counter >= patience:
-                print(f"No improvement for {patience} stages. Early stopping.")
-                # Restore best model weights
-                self.load_state_dict(best_state)
-                break
-                
-        # Specialized prompt fine-tuning
-        print("=== Final Prompt Fine-tuning ===")
-        # Focus on a few specialized tasks like retention
-        fine_tune_epochs = phase2_epochs // 4
-        
-        # Create specialized batches with both old and new items
-        # This helps prompts specialize in handling forgetting
-        for epoch in range(1, fine_tune_epochs + 1):
+        for epoch in range(1, phase2_epochs + 1):
             for step in range(num_batch):
                 u, seq, pos, neg = t1_sampler.next_batch()
                 
@@ -460,17 +406,45 @@ class PromptBaseSASRec(SASRec):
                 loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
                 loss.backward()
                 phase2_optimizer.step()
-            
+                
             if epoch % args.print_freq == 0:
+                # Create dataset with self.usernum and self.itemnum instead of args.usernum and args.itemnum
                 t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
-                print(f"[Fine-tune epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+                print(f"[Phase 2 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
         
-        # Unfreeze all parameters for future incremental learning
+        # Phase 3: Fine-tune everything together
+        print("=== Phase 3: Fine-tuning entire model with prompts ===")
+        # Unfreeze all parameters
         for param in self.parameters():
             param.requires_grad = True
         
+        # Use a lower learning rate for fine-tuning
+        phase3_optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=args.lr * 0.1, betas=(0.9, 0.98)
+        )
+        
+        # Train for the remaining epochs
+        phase3_epochs = max(1, args.num_epochs - phase1_epochs - phase2_epochs)
+        
+        for epoch in range(1, phase3_epochs + 1):
+            for step in range(num_batch):
+                u, seq, pos, neg = t1_sampler.next_batch()
+                
+                phase3_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase3_optimizer.step()
+                
+            if epoch % args.print_freq == 0:
+                # Evaluate and print results
+                t_test = evaluate(self, [train_data, valid_data, test_data, self.usernum, self.itemnum], args, device)
+                print(f"[Phase 3 epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}")
+        
+        
         # Close sampler
         t1_sampler.close()
+
 
     def train_two_phase(self, train_data, valid_data, args, device, num_epochs=None):
         """
