@@ -52,14 +52,8 @@ class PromptManager:
                 'unseen_items': {}
             }
         }
-        
-        # Sample users from dataset
-        user_train = dataset[0]
-        all_users = list(user_train.keys())
-        if len(all_users) > 100:
-            sample_users = np.random.choice(all_users, 100, replace=False)
-        else:
-            sample_users = all_users
+        # Get the current number of prompts from the model
+        current_num_prompts = self.prompt_model.prompt_bank.prompts.size(0)
             
         # Track prompt usage (on the right device)
         prompt_usage = torch.zeros(self.num_prompts, device=device)
@@ -73,6 +67,14 @@ class PromptManager:
         # Track co-occurrence of prompts (how often are they selected together)
         prompt_cooccurrence = torch.zeros(self.num_prompts, self.num_prompts, device=device)
         
+        # Sample users from dataset
+        user_train = dataset[0]
+        all_users = list(user_train.keys())
+        if len(all_users) > 100:
+            sample_users = np.random.choice(all_users, 100, replace=False)
+        else:
+            sample_users = all_users
+
         total_old = 0
         total_new = 0
         total_unseen = 0
@@ -174,7 +176,7 @@ class PromptManager:
         
         # Calculate prompt specialization scores
         # Higher score means the prompt tends to be used for specific item types
-        prompt_specialization = torch.zeros(self.num_prompts, device=device)
+        prompt_specialization = torch.zeros(current_num_prompts, device=device)
         if total_old > 0 and total_new > 0:
             for i in range(self.num_prompts):
                 # Calculate how differently this prompt is used for old vs new items
@@ -192,7 +194,7 @@ class PromptManager:
         
         # Calculate specialized roles based on usage patterns
         roles = []
-        for i in range(self.num_prompts):
+        for i in range(current_num_prompts):
             if old_item_usage[i] > new_item_usage[i] * 1.5:
                 roles.append("Old Items Specialist")
             elif new_item_usage[i] > old_item_usage[i] * 1.5:
