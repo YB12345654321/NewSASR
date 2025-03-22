@@ -40,6 +40,7 @@ class PromptManager:
         """
         # Normalize prompt importance
         prompt_importance = self.prompt_model.prompt_importance
+        print("value of prompt_importance", prompt_importance)
         if torch.sum(prompt_importance) > 0:
             normalized_importance = prompt_importance / torch.sum(prompt_importance)
             
@@ -51,7 +52,7 @@ class PromptManager:
                 # Register gradient hook for selective updating
                 def grad_hook(grad):
                     # Create mask based on importance threshold
-                    mask = normalized_importance > self.importance_threshold
+                    mask = torch.ones_like(normalized_importance, dtype=torch.bool) #normalized_importance > self.importance_threshold
                     mask = mask.to(grad.device)
                     # Zero out gradients for important prompts (freeze them)
                     mask_expanded = mask.unsqueeze(1).expand_as(grad)
