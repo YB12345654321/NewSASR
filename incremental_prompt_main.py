@@ -16,7 +16,7 @@ from incremental_data import TimeSlicedData, ExperienceReplay
 from eval_incremental import evaluate_incremental, evaluate_forgetting
 
 # Import prompt-based components
-from prompt_model import PromptBaseSASRec, PromptBank #, setup_prompt_gradient_masking, ensure_hybrid_prompt_freezing, generate_new_prompts
+from prompt_model import EnsemblePromptSASRec, PromptBaseSASRec, PromptBank #, setup_prompt_gradient_masking, ensure_hybrid_prompt_freezing, generate_new_prompts
 from prompt_manager import PromptManager
 
 parser = argparse.ArgumentParser()
@@ -422,7 +422,7 @@ def freeze_prompts(model, freeze=True):
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
     Run prompt-based incremental learning experiment with hybrid prompt freezing
-    and new prompt generation during incremental learning
+    and ensemble modeling for forgetting mitigation
     """
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -443,16 +443,23 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     
     # Implement hybrid prompt freezing strategy
     print("=== Implementing hybrid prompt freezing strategy ===")
-    # # Add the new methods to the model instance
-    # prompt_model.setup_prompt_gradient_masking = setup_prompt_gradient_masking.__get__(prompt_model)
-    # prompt_model.ensure_hybrid_prompt_freezing = ensure_hybrid_prompt_freezing.__get__(prompt_model)
-    
-    # Apply the hybrid freezing
     prompt_model.ensure_hybrid_prompt_freezing()
 
     # Save prompt-based model
     torch.save(prompt_model, os.path.join(output_dir, 'prompt_base_model.pt'))
     print(f"Prompt-based model saved to {os.path.join(output_dir, 'prompt_base_model.pt')}")
+
+    # Create a FROZEN COPY of the T1 model for ensemble prediction
+    frozen_t1_model = copy.deepcopy(prompt_model)
+    
+    # Ensure the frozen model is in eval mode and has no gradients
+    frozen_t1_model.eval()
+    for param in frozen_t1_model.parameters():
+        param.requires_grad = False
+    
+    # Save the frozen model separately
+    torch.save(frozen_t1_model, os.path.join(output_dir, 'frozen_t1_model.pt'))
+    print(f"Frozen T1 model saved to {os.path.join(output_dir, 'frozen_t1_model.pt')}")
 
     # Get items from T1
     t1_users, t1_items = time_data.get_slice_data(0)
@@ -468,7 +475,8 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     
     # Results storage
     results = {
-        'prompt_model': {}
+        'prompt_model': {},
+        'ensemble_model': {}  # Add this for storing ensemble results
     }
     
     # Evaluate prompt-based model on all slices
@@ -502,12 +510,8 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         slice_data = time_data.prepare_slice(slice_idx, include_previous=False)
         [slice_user_train, slice_user_valid, slice_user_test, _, _] = slice_data
         
-        # Generate new prompts from current slice
-        if slice_idx > 1:  # After the first incremental update
-            # Add the new method to the model instance
-            # prompt_model.generate_new_prompts = generate_new_prompts.__get__(prompt_model)
-            
-            # Generate new prompts from current slice
+        # Generate new prompts from current slice if we're past the first incremental update
+        if slice_idx > 1:
             new_prompt_count = prompt_model.generate_new_prompts(slice_data, num_new_prompts=4, device=device)
             
             # Re-apply hybrid freezing after adding new prompts
@@ -644,6 +648,25 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
             else:
                 results['prompt_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
                 print(f"Prompt model on slice {i}: No valid test users found. Skipping.")
+
+        # Create the ensemble model to mitigate catastrophic forgetting
+        ensemble_model = EnsemblePromptSASRec(frozen_t1_model, prompt_model, alpha=0.4)
+        
+        # Save ensemble model
+        torch.save(ensemble_model, os.path.join(output_dir, f'ensemble_model_slice_{slice_idx}.pt'))
+        
+        # Evaluate ensemble model on all slices
+        print(f"\n=== Evaluating Ensemble Model After Slice {slice_idx} ===")
+        for i in range(args.num_slices):
+            eval_data = time_data.prepare_slice(i, include_previous=False)
+            if check_dataset_validity(eval_data):
+                ndcg, hr = evaluate(ensemble_model, eval_data, args, device)
+                results['ensemble_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': ndcg, 'hr': hr}
+                print(f"Ensemble model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}")
+                log_file.write(f"Ensemble model (after slice {slice_idx}) on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}\n")
+            else:
+                results['ensemble_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
+                print(f"Ensemble model on slice {i}: No valid test users found. Skipping.")
     
     # Save final results
     with open(os.path.join(output_dir, 'results_prompt.pkl'), 'wb') as f:
@@ -652,7 +675,6 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     print("\n=== Prompt-Based Incremental Learning Experiment Completed ===")
     
     return results
-
 
 def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
     """

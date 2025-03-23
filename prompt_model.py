@@ -712,3 +712,45 @@ class PromptBaseSASRec(SASRec):
         self.setup_prompt_gradient_masking(frozen_indices)
         
         return frozen_indices
+    
+class EnsemblePromptSASRec(nn.Module):
+    """
+    Ensemble model that combines predictions from a frozen T1 model and an incrementally trained model
+    """
+    def __init__(self, frozen_t1_model, incremental_model, alpha=0.5):
+        super(EnsemblePromptSASRec, self).__init__()
+        self.frozen_t1_model = frozen_t1_model
+        self.incremental_model = incremental_model
+        self.alpha = alpha  # Weight for the frozen model (0-1)
+        
+        # Ensure frozen model stays frozen
+        for param in self.frozen_t1_model.parameters():
+            param.requires_grad = False
+            
+        # Reference to device for consistency
+        self.dev = incremental_model.dev
+        
+    def predict(self, u, seq, item_idx):
+        """
+        Make ensemble predictions using both models
+        
+        Args:
+            u: User indices
+            seq: Sequence of items
+            item_idx: Items to score
+        """
+        # Get predictions from both models
+        with torch.no_grad():
+            frozen_scores = self.frozen_t1_model.predict(u, seq, item_idx)
+            incremental_scores = self.incremental_model.predict(u, seq, item_idx)
+            
+            # Weighted combination
+            combined_scores = self.alpha * frozen_scores + (1 - self.alpha) * incremental_scores
+            
+        return combined_scores
+        
+    def forward(self, u, seq, pos, neg, is_training=True):
+        """
+        For training, only update incremental model
+        """
+        return self.incremental_model(u, seq, pos, neg, is_training=is_training)
