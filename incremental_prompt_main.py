@@ -59,6 +59,7 @@ parser.add_argument('--extract_prompts', action='store_true', help='Extract prom
 parser.add_argument('--prompt_layer_idx', default=0, type=int, help='Layer index to extract prompts from')
 parser.add_argument('--freeze_prompts', action='store_true', help='Freeze prompts after initial training')
 parser.add_argument('--num_new_prompts', default=4, type=int, help='Number of new prompts to be added in each epoch')
+
 def set_seed(seed):
     """
     Set random seed for reproducibility
@@ -651,7 +652,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 print(f"Prompt model on slice {i}: No valid test users found. Skipping.")
 
         # Create the ensemble model to mitigate catastrophic forgetting
-        ensemble_model = EnsemblePromptSASRec(frozen_t1_model, prompt_model, alpha=0.4)
+        ensemble_model = EnsemblePromptSASRec(frozen_t1_model, prompt_model, alpha=0.2)
         
         # Save ensemble model
         torch.save(ensemble_model, os.path.join(output_dir, f'ensemble_model_slice_{slice_idx}.pt'))

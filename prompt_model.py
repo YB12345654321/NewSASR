@@ -18,7 +18,7 @@ class PromptBank(nn.Module):
         self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
         
-    def forward(self, query_embedding, top_k=3):
+    def forward(self, query_embedding, top_k=10):
         """
         Select relevant prompts based on query embedding
         
@@ -717,7 +717,7 @@ class EnsemblePromptSASRec(nn.Module):
     """
     Ensemble model that combines predictions from a frozen T1 model and an incrementally trained model
     """
-    def __init__(self, frozen_t1_model, incremental_model, alpha=0.5):
+    def __init__(self, frozen_t1_model, incremental_model, alpha=0.3):
         super(EnsemblePromptSASRec, self).__init__()
         self.frozen_t1_model = frozen_t1_model
         self.incremental_model = incremental_model
