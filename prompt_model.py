@@ -705,7 +705,7 @@ class PromptBaseSASRec(SASRec):
         
         # Determine which prompts to freeze (memory prompts)
         # For example, freeze the first 16 prompts (or all if fewer than 16)
-        frozen_count = min(16, self.num_prompts)
+        frozen_count = min(1024, self.num_prompts)
         frozen_indices = list(range(frozen_count))
         
         # Set up gradient masking for these prompts
