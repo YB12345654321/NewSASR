@@ -58,6 +58,7 @@ parser.add_argument('--run_both', action='store_true', help='Run both regular in
 parser.add_argument('--extract_prompts', action='store_true', help='Extract prompts from transformer layers')
 parser.add_argument('--prompt_layer_idx', default=0, type=int, help='Layer index to extract prompts from')
 parser.add_argument('--freeze_prompts', action='store_true', help='Freeze prompts after initial training')
+parser.add_argument('--num_new_prompts', default=4, type=int, help='Number of new prompts to be added in each epoch')
 def set_seed(seed):
     """
     Set random seed for reproducibility
@@ -512,7 +513,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         
         # Generate new prompts from current slice if we're past the first incremental update
         if slice_idx > 1:
-            new_prompt_count = prompt_model.generate_new_prompts(slice_data, num_new_prompts=4, device=device)
+            new_prompt_count = prompt_model.generate_new_prompts(slice_data, num_new_prompts=args.num_new_prompts, device=device)
             
             # Re-apply hybrid freezing after adding new prompts
             prompt_model.ensure_hybrid_prompt_freezing()
