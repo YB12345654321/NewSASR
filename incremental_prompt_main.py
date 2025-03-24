@@ -52,14 +52,14 @@ parser.add_argument('--load_splits', default=None, type=str, help='Path to load 
 parser.add_argument('--save_splits', action='store_true', help='Whether to save data splits for future use')
 
 # Prompt-based arguments
-parser.add_argument('--num_prompts', default=8, type=int, help='Number of prompts in the bank')
+parser.add_argument('--num_prompts', default=512, type=int, help='Number of prompts in the bank')
 parser.add_argument('--prompt_mix_ratio', default=0.3, type=float, help='Mixing ratio for prompts')
 parser.add_argument('--run_both', action='store_true', help='Run both regular incremental and prompt-based models')
 parser.add_argument('--extract_prompts', action='store_true', help='Extract prompts from transformer layers')
 parser.add_argument('--prompt_layer_idx', default=0, type=int, help='Layer index to extract prompts from')
 parser.add_argument('--freeze_prompts', action='store_true', help='Freeze prompts after initial training')
-parser.add_argument('--num_new_prompts', default=4, type=int, help='Number of new prompts to be added in each epoch')
-parser.add_argument('--frozen_prompt_count', default=1024, type=int, 
+parser.add_argument('--num_new_prompts', default=256, type=int, help='Number of new prompts to be added in each epoch')
+parser.add_argument('--frozen_prompt_count', default=256, type=int, 
                     help='Number of prompts to keep frozen during incremental learning')
 
 def set_seed(seed):
@@ -531,32 +531,35 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         slice_buffer = time_data.create_replay_buffer(slice_idx, args.buffer_size, max_seq_length=1)
         replay_buffer.update_buffer(slice_buffer)
 
-        # Determine number of epochs for each phase
+        # Update this section in run_prompt_incremental_learning function
+        # Determine number of epochs for each phase with optimized distribution
         inc_epochs_total = args.num_epochs // 4  # Fewer epochs for incremental learning
-        phase1_epochs = inc_epochs_total // 3
-        phase2_epochs = inc_epochs_total // 3
-        phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs
-        
+        phase1_epochs = int(inc_epochs_total * 0.3)  # 30% for Phase 1
+        phase2_epochs = int(inc_epochs_total * 0.5)  # 50% for Phase 2
+        phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs  # Remaining for Phase 3
+
+        print(f"Phase distribution: Phase 1 = {phase1_epochs} epochs, Phase 2 = {phase2_epochs} epochs, Phase 3 = {phase3_epochs} epochs")
+
         # ====================================================================
         # PHASE 1: Train base model with minimal prompt influence
         # ====================================================================
         print(f"=== Phase 1: Training on slice {slice_idx} with minimal prompt influence ===")
-        
+
         # Store original prompt_mix_ratio
         original_mix_ratio = prompt_model.prompt_mix_ratio
-        
+
         # Set a very low mix ratio for Phase 1
         prompt_model.prompt_mix_ratio = 0.05
-        
+
         # Create sampler for this slice
         slice_sampler = WarpSampler(slice_user_train, usernum, itemnum,
-                                  batch_size=args.batch_size, maxlen=args.maxlen,
-                                  threshold_user=args.threshold_user,
-                                  threshold_item=args.threshold_item,
-                                  n_workers=3, device=device)
-        
-        # Create optimizer for all parameters
-        phase1_lr = args.lr * 0.1  # Lower learning rate for incremental learning
+                                batch_size=args.batch_size, maxlen=args.maxlen,
+                                threshold_user=args.threshold_user,
+                                threshold_item=args.threshold_item,
+                                n_workers=3, device=device)
+
+        # Create optimizer for all parameters - keep learning rate as is
+        phase1_lr = args.lr * 0.1
         phase1_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=phase1_lr, betas=(0.9, 0.98))
         
         # Determine number of batches
@@ -646,21 +649,23 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         # PHASE 2: Train prompts with frozen base model
         # ====================================================================
         print(f"=== Phase 2: Training prompts for slice {slice_idx} with base model frozen ===")
-        
-        # Restore original prompt mixing ratio
-        prompt_model.prompt_mix_ratio = original_mix_ratio
-        
+
+        # Restore original prompt mixing ratio with a boost
+        prompt_model.prompt_mix_ratio = original_mix_ratio * 1.2  # Increase by 20%
+
         # Freeze all non-prompt parameters
         for name, param in prompt_model.named_parameters():
             if 'prompt_bank' not in name:
                 param.requires_grad = False
-        
-        # Create optimizer for prompt parameters only
-        phase2_lr = args.lr * 0.05  # Even lower learning rate for prompt specialization
+
+        # Create optimizer for prompt parameters with higher learning rate
+        phase2_lr = args.lr * 0.2  # Increased from 0.05 to 0.2 (4x higher)
         phase2_optimizer = torch.optim.Adam(
             prompt_model.prompt_bank.parameters(),
             lr=phase2_lr, betas=(0.9, 0.98)
         )
+
+        print(f"Phase 2 learning rate increased to {phase2_lr:.6f}")
         
         t0 = time.time()
         
@@ -747,9 +752,12 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         # PHASE 3: Fine-tune entire model
         # ====================================================================
         print(f"=== Phase 3: Fine-tuning all parameters for slice {slice_idx} ===")
-        
+
+        # Restore normal prompt mix ratio
+        prompt_model.prompt_mix_ratio = original_mix_ratio
+
         # Get the frozen_prompt_count
-        frozen_count = getattr(args, 'frozen_prompt_count', 1024)
+        frozen_count = getattr(args, 'frozen_prompt_count', 256)  # Default to 256
         
         # Unfreeze all parameters except permanently frozen prompts
         for name, param in prompt_model.named_parameters():
@@ -765,12 +773,14 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         
         # Reapply hybrid prompt freezing to ensure correct gradient masking
         prompt_model.ensure_hybrid_prompt_freezing()
-        # Create optimizer with very low learning rate
-        phase3_lr = args.lr * 0.01  # Very low learning rate for fine-tuning
+        # Create optimizer with slightly higher learning rate
+        phase3_lr = args.lr * 0.02  # Increased from 0.01 to 0.02 (2x higher)
         phase3_optimizer = torch.optim.Adam(
             [p for p in prompt_model.parameters() if p.requires_grad],
             lr=phase3_lr, betas=(0.9, 0.98)
         )
+
+        print(f"Phase 3 learning rate increased to {phase3_lr:.6f}")
         
         t0 = time.time()
         

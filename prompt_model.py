@@ -716,177 +716,179 @@ class PromptBaseSASRec(SASRec):
         
         return frozen_indices
     
-
-    def train_incremental_phases(self, train_data, valid_data, test_data, args, device, base_model=None):
-        """
-        Three-phase training approach for incremental slices:
-        1. Train base model with minimal prompt influence
-        2. Train prompts with frozen base model
-        3. Fine-tune everything together with a lower learning rate
-        
-        Args:
-            train_data: User-item interactions for training
-            valid_data: User-item interactions for validation
-            test_data: User-item interactions for testing
-            args: Command line arguments
-            device: Device to run on
-            base_model: Optional base model for distillation
-        """
-        # Create sampler
-        sampler = WarpSampler(train_data, self.usernum, self.itemnum,
-                            batch_size=args.batch_size, maxlen=args.maxlen,
-                            threshold_user=args.threshold_user,
-                            threshold_item=args.threshold_item,
-                            n_workers=3, device=device)
-        
-        # Prepare evaluation data
-        eval_data = [train_data, valid_data, test_data, self.usernum, self.itemnum]
-        
-        # Get number of epochs for each phase
-        total_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
-        phase1_epochs = max(1, total_epochs // 3)
-        phase2_epochs = max(1, total_epochs // 3)
-        phase3_epochs = max(1, total_epochs - phase1_epochs - phase2_epochs)
-        
-        # Store original prompt mixing ratio
-        original_mix_ratio = self.prompt_mix_ratio
-        
-        # ===========================================================
-        # Phase 1: Train with minimal prompt influence
-        # ===========================================================
-        print("=== Phase 1: Training with minimal prompt influence ===")
-        
-        # Reduce prompt influence
-        self.prompt_mix_ratio = 0.05
-        
-        # Make all parameters trainable
-        for param in self.parameters():
-            param.requires_grad = True
-        
-        # Ensure hybrid freezing is still respected
-        self.ensure_hybrid_prompt_freezing()
-        
-        # Create optimizer
-        phase1_lr = args.lr * 0.1  # Lower learning rate for stability
-        phase1_optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=phase1_lr, betas=(0.9, 0.98)
-        )
-        
-        # Train Phase 1
-        num_batch = max(len(train_data) // args.batch_size, 1)
-        for epoch in range(1, phase1_epochs + 1):
-            total_loss = 0
-            for step in range(num_batch):
-                u, seq, pos, neg = sampler.next_batch()
-                
-                phase1_optimizer.zero_grad()
-                loss, _, _, _ = self(u, seq, pos, neg, is_training=True, base_model=base_model)
-                loss.backward()
-                phase1_optimizer.step()
-                
-                total_loss += loss.item()
+    # For the train_incremental_phases method in PromptBaseSASRec class
+def train_incremental_phases(self, train_data, valid_data, test_data, args, device, base_model=None):
+    """
+    Three-phase training approach for incremental slices with optimized learning rates and epoch allocation:
+    1. Train base model with minimal prompt influence (30% of epochs)
+    2. Train prompts with frozen base model (50% of epochs) - higher learning rate
+    3. Fine-tune everything together with a lower learning rate (20% of epochs)
+    """
+    # Create sampler
+    sampler = WarpSampler(train_data, self.usernum, self.itemnum,
+                         batch_size=args.batch_size, maxlen=args.maxlen,
+                         threshold_user=args.threshold_user,
+                         threshold_item=args.threshold_item,
+                         n_workers=3, device=device)
+    
+    # Prepare evaluation data
+    eval_data = [train_data, valid_data, test_data, self.usernum, self.itemnum]
+    
+    # Get number of epochs for each phase with new distribution
+    total_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
+    phase1_epochs = max(1, int(total_epochs * 0.3))  # 30% for Phase 1
+    phase2_epochs = max(1, int(total_epochs * 0.5))  # 50% for Phase 2
+    phase3_epochs = max(1, total_epochs - phase1_epochs - phase2_epochs)  # Remaining for Phase 3
+    
+    print(f"Phase distribution: Phase 1 = {phase1_epochs} epochs, Phase 2 = {phase2_epochs} epochs, Phase 3 = {phase3_epochs} epochs")
+    
+    # Store original prompt mixing ratio
+    original_mix_ratio = self.prompt_mix_ratio
+    
+    # ===========================================================
+    # Phase 1: Train with minimal prompt influence
+    # ===========================================================
+    print("=== Phase 1: Training with minimal prompt influence ===")
+    
+    # Reduce prompt influence
+    self.prompt_mix_ratio = 0.05
+    
+    # Make all parameters trainable
+    for param in self.parameters():
+        param.requires_grad = True
+    
+    # Ensure hybrid freezing is still respected
+    self.ensure_hybrid_prompt_freezing()
+    
+    # Create optimizer - keep Phase 1 learning rate as is
+    phase1_lr = args.lr * 0.1  # Keeping the same: 10% of original LR
+    phase1_optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, self.parameters()),
+        lr=phase1_lr, betas=(0.9, 0.98)
+    )
+    
+    # Train Phase 1
+    num_batch = max(len(train_data) // args.batch_size, 1)
+    for epoch in range(1, phase1_epochs + 1):
+        total_loss = 0
+        for step in range(num_batch):
+            u, seq, pos, neg = sampler.next_batch()
             
-            # Evaluate after each epoch or at specified intervals
-            if epoch % args.print_freq == 0 or epoch == phase1_epochs:
-                avg_loss = total_loss / num_batch
-                ndcg, hr = evaluate(self, eval_data, args, device)
-                print(f"[Phase 1 epoch {epoch}/{phase1_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+            phase1_optimizer.zero_grad()
+            loss, _, _, _ = self(u, seq, pos, neg, is_training=True, base_model=base_model)
+            loss.backward()
+            phase1_optimizer.step()
+            
+            total_loss += loss.item()
         
-        # ===========================================================
-        # Phase 2: Train prompts with frozen base model
-        # ===========================================================
-        print("=== Phase 2: Training prompts with frozen base model ===")
+        # Evaluate after each epoch or at specified intervals
+        if epoch % args.print_freq == 0 or epoch == phase1_epochs:
+            avg_loss = total_loss / num_batch
+            ndcg, hr = evaluate(self, eval_data, args, device)
+            print(f"[Phase 1 epoch {epoch}/{phase1_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+    
+    # ===========================================================
+    # Phase 2: Train prompts with frozen base model
+    # ===========================================================
+    print("=== Phase 2: Training prompts with frozen base model ===")
+    
+    # Restore original prompt mix ratio with a boost to emphasize prompt influence
+    self.prompt_mix_ratio = original_mix_ratio * 1.2  # Increase by 20% to emphasize prompts
+    
+    # Freeze all non-prompt parameters
+    for name, param in self.named_parameters():
+        if 'prompt_bank' not in name:
+            param.requires_grad = False
+    
+    # Create optimizer for prompt parameters with higher learning rate
+    phase2_lr = args.lr * 0.2  # Increased from 0.05 to 0.2 (4x higher)
+    phase2_optimizer = torch.optim.Adam(
+        self.prompt_bank.parameters(),
+        lr=phase2_lr, betas=(0.9, 0.98)
+    )
+    
+    print(f"Phase 2 learning rate increased to {phase2_lr:.6f} (from {args.lr * 0.05:.6f})")
+    
+    # Train Phase 2 - now with more epochs
+    for epoch in range(1, phase2_epochs + 1):
+        total_loss = 0
+        for step in range(num_batch):
+            u, seq, pos, neg = sampler.next_batch()
+            
+            phase2_optimizer.zero_grad()
+            loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+            loss.backward()
+            phase2_optimizer.step()
+            
+            total_loss += loss.item()
         
-        # Restore original prompt mix ratio
-        self.prompt_mix_ratio = original_mix_ratio
-        
-        # Freeze all non-prompt parameters
-        for name, param in self.named_parameters():
-            if 'prompt_bank' not in name:
+        # Evaluate after each epoch or at specified intervals
+        if epoch % args.print_freq == 0 or epoch == phase2_epochs:
+            avg_loss = total_loss / num_batch
+            ndcg, hr = evaluate(self, eval_data, args, device)
+            print(f"[Phase 2 epoch {epoch}/{phase2_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+    
+    # ===========================================================
+    # Phase 3: Fine-tune entire model with prompts
+    # ===========================================================
+    print("=== Phase 3: Fine-tuning entire model with prompts ===")
+    
+    # Restore normal prompt mix ratio
+    self.prompt_mix_ratio = original_mix_ratio
+    
+    # Get the frozen_prompt_count from args
+    frozen_count = getattr(args, 'frozen_prompt_count', 256)  # Default to 256 instead of 1024
+    
+    # Unfreeze all parameters (except those that should remain frozen)
+    for name, param in self.named_parameters():
+        if name.startswith('prompt_bank.prompts'):
+            prompt_idx = int(name.split('.')[2]) if len(name.split('.')) > 2 else -1
+            if prompt_idx >= 0 and prompt_idx < frozen_count:
                 param.requires_grad = False
-        
-        # Create optimizer for prompt parameters only
-        phase2_lr = args.lr * 0.05  # Lower learning rate for prompt training
-        phase2_optimizer = torch.optim.Adam(
-            self.prompt_bank.parameters(),
-            lr=phase2_lr, betas=(0.9, 0.98)
-        )
-        
-        # Train Phase 2
-        for epoch in range(1, phase2_epochs + 1):
-            total_loss = 0
-            for step in range(num_batch):
-                u, seq, pos, neg = sampler.next_batch()
-                
-                phase2_optimizer.zero_grad()
-                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
-                loss.backward()
-                phase2_optimizer.step()
-                
-                total_loss += loss.item()
-            
-            # Evaluate after each epoch or at specified intervals
-            if epoch % args.print_freq == 0 or epoch == phase2_epochs:
-                avg_loss = total_loss / num_batch
-                ndcg, hr = evaluate(self, eval_data, args, device)
-                print(f"[Phase 2 epoch {epoch}/{phase2_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
-        
-        # ===========================================================
-        # Phase 3: Fine-tune entire model with prompts
-        # ===========================================================
-        print("=== Phase 3: Fine-tuning entire model with prompts ===")
-        
-        # Get the frozen_prompt_count from args
-        frozen_count = getattr(args, 'frozen_prompt_count', 1024)
-        
-        # Unfreeze all parameters (except those that should remain frozen)
-        for name, param in self.named_parameters():
-            # Don't unfreeze frozen prompts (the first frozen_count prompts)
-            if name.startswith('prompt_bank.prompts'):
-                prompt_idx = int(name.split('.')[2]) if len(name.split('.')) > 2 else -1
-                if prompt_idx >= 0 and prompt_idx < frozen_count:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
             else:
                 param.requires_grad = True
-        
-        # Re-apply hybrid prompt freezing to ensure correct gradient masking
-        self.ensure_hybrid_prompt_freezing()
-        
-        # Create optimizer with lower learning rate
-        phase3_lr = args.lr * 0.01  # Very low learning rate for fine-tuning
-        phase3_optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=phase3_lr, betas=(0.9, 0.98)
-        )
-        
-        # Train Phase 3
-        for epoch in range(1, phase3_epochs + 1):
-            total_loss = 0
-            for step in range(num_batch):
-                u, seq, pos, neg = sampler.next_batch()
-                
-                phase3_optimizer.zero_grad()
-                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
-                loss.backward()
-                phase3_optimizer.step()
-                
-                total_loss += loss.item()
+        else:
+            param.requires_grad = True
+    
+    # Re-apply hybrid prompt freezing to ensure correct gradient masking
+    self.ensure_hybrid_prompt_freezing()
+    
+    # Create optimizer with slightly higher learning rate than before
+    phase3_lr = args.lr * 0.02  # Increased from 0.01 to 0.02 (2x higher)
+    phase3_optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, self.parameters()),
+        lr=phase3_lr, betas=(0.9, 0.98)
+    )
+    
+    print(f"Phase 3 learning rate increased to {phase3_lr:.6f} (from {args.lr * 0.01:.6f})")
+    
+    # Train Phase 3
+    for epoch in range(1, phase3_epochs + 1):
+        total_loss = 0
+        for step in range(num_batch):
+            u, seq, pos, neg = sampler.next_batch()
             
-            # Evaluate after each epoch or at specified intervals
-            if epoch % args.print_freq == 0 or epoch == phase3_epochs:
-                avg_loss = total_loss / num_batch
-                ndcg, hr = evaluate(self, eval_data, args, device)
-                print(f"[Phase 3 epoch {epoch}/{phase3_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+            phase3_optimizer.zero_grad()
+            loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+            loss.backward()
+            phase3_optimizer.step()
+            
+            total_loss += loss.item()
         
-        # Close sampler
-        sampler.close()
-        
-        # Return final performance metrics
-        final_ndcg, final_hr = evaluate(self, eval_data, args, device)
-        return final_ndcg, final_hr
+        # Evaluate after each epoch or at specified intervals
+        if epoch % args.print_freq == 0 or epoch == phase3_epochs:
+            avg_loss = total_loss / num_batch
+            ndcg, hr = evaluate(self, eval_data, args, device)
+            print(f"[Phase 3 epoch {epoch}/{phase3_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+    
+    # Close sampler
+    sampler.close()
+    
+    # Return final performance metrics
+    final_ndcg, final_hr = evaluate(self, eval_data, args, device)
+    return final_ndcg, final_hr
+
+
     
 class EnsemblePromptSASRec(nn.Module):
     """
