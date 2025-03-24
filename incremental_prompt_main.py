@@ -294,7 +294,7 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
         replay_buffer.update_buffer(slice_buffer)
         
         # Train for fewer epochs
-        inc_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
+        inc_epochs = args.num_epochs // 2  # Fewer epochs for incremental learning
         t0 = time.time()
 
         for epoch in range(1, inc_epochs + 1):
@@ -533,7 +533,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
 
         # Update this section in run_prompt_incremental_learning function
         # Determine number of epochs for each phase with optimized distribution
-        inc_epochs_total = args.num_epochs // 4  # Fewer epochs for incremental learning
+        inc_epochs_total = args.num_epochs // 2  # Fewer epochs for incremental learning
         phase1_epochs = int(inc_epochs_total * 0.3)  # 30% for Phase 1
         phase2_epochs = int(inc_epochs_total * 0.5)  # 50% for Phase 2
         phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs  # Remaining for Phase 3
