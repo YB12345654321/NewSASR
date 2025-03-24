@@ -703,15 +703,190 @@ class PromptBaseSASRec(SASRec):
         """
         print("=== Ensuring hybrid prompt freezing during incremental learning ===")
         
+        # Get the frozen_prompt_count from args, defaulting to 1024 if not specified
+        frozen_count = getattr(self.args, 'frozen_prompt_count', 1024)
+        
         # Determine which prompts to freeze (memory prompts)
-        # For example, freeze the first 16 prompts (or all if fewer than 16)
-        frozen_count = min(1024, self.num_prompts)
+        # Freeze the first frozen_count prompts (or all if fewer than frozen_count)
+        frozen_count = min(frozen_count, self.num_prompts)
         frozen_indices = list(range(frozen_count))
         
         # Set up gradient masking for these prompts
         self.setup_prompt_gradient_masking(frozen_indices)
         
         return frozen_indices
+    
+
+    def train_incremental_phases(self, train_data, valid_data, test_data, args, device, base_model=None):
+        """
+        Three-phase training approach for incremental slices:
+        1. Train base model with minimal prompt influence
+        2. Train prompts with frozen base model
+        3. Fine-tune everything together with a lower learning rate
+        
+        Args:
+            train_data: User-item interactions for training
+            valid_data: User-item interactions for validation
+            test_data: User-item interactions for testing
+            args: Command line arguments
+            device: Device to run on
+            base_model: Optional base model for distillation
+        """
+        # Create sampler
+        sampler = WarpSampler(train_data, self.usernum, self.itemnum,
+                            batch_size=args.batch_size, maxlen=args.maxlen,
+                            threshold_user=args.threshold_user,
+                            threshold_item=args.threshold_item,
+                            n_workers=3, device=device)
+        
+        # Prepare evaluation data
+        eval_data = [train_data, valid_data, test_data, self.usernum, self.itemnum]
+        
+        # Get number of epochs for each phase
+        total_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
+        phase1_epochs = max(1, total_epochs // 3)
+        phase2_epochs = max(1, total_epochs // 3)
+        phase3_epochs = max(1, total_epochs - phase1_epochs - phase2_epochs)
+        
+        # Store original prompt mixing ratio
+        original_mix_ratio = self.prompt_mix_ratio
+        
+        # ===========================================================
+        # Phase 1: Train with minimal prompt influence
+        # ===========================================================
+        print("=== Phase 1: Training with minimal prompt influence ===")
+        
+        # Reduce prompt influence
+        self.prompt_mix_ratio = 0.05
+        
+        # Make all parameters trainable
+        for param in self.parameters():
+            param.requires_grad = True
+        
+        # Ensure hybrid freezing is still respected
+        self.ensure_hybrid_prompt_freezing()
+        
+        # Create optimizer
+        phase1_lr = args.lr * 0.1  # Lower learning rate for stability
+        phase1_optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=phase1_lr, betas=(0.9, 0.98)
+        )
+        
+        # Train Phase 1
+        num_batch = max(len(train_data) // args.batch_size, 1)
+        for epoch in range(1, phase1_epochs + 1):
+            total_loss = 0
+            for step in range(num_batch):
+                u, seq, pos, neg = sampler.next_batch()
+                
+                phase1_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True, base_model=base_model)
+                loss.backward()
+                phase1_optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # Evaluate after each epoch or at specified intervals
+            if epoch % args.print_freq == 0 or epoch == phase1_epochs:
+                avg_loss = total_loss / num_batch
+                ndcg, hr = evaluate(self, eval_data, args, device)
+                print(f"[Phase 1 epoch {epoch}/{phase1_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+        
+        # ===========================================================
+        # Phase 2: Train prompts with frozen base model
+        # ===========================================================
+        print("=== Phase 2: Training prompts with frozen base model ===")
+        
+        # Restore original prompt mix ratio
+        self.prompt_mix_ratio = original_mix_ratio
+        
+        # Freeze all non-prompt parameters
+        for name, param in self.named_parameters():
+            if 'prompt_bank' not in name:
+                param.requires_grad = False
+        
+        # Create optimizer for prompt parameters only
+        phase2_lr = args.lr * 0.05  # Lower learning rate for prompt training
+        phase2_optimizer = torch.optim.Adam(
+            self.prompt_bank.parameters(),
+            lr=phase2_lr, betas=(0.9, 0.98)
+        )
+        
+        # Train Phase 2
+        for epoch in range(1, phase2_epochs + 1):
+            total_loss = 0
+            for step in range(num_batch):
+                u, seq, pos, neg = sampler.next_batch()
+                
+                phase2_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase2_optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # Evaluate after each epoch or at specified intervals
+            if epoch % args.print_freq == 0 or epoch == phase2_epochs:
+                avg_loss = total_loss / num_batch
+                ndcg, hr = evaluate(self, eval_data, args, device)
+                print(f"[Phase 2 epoch {epoch}/{phase2_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+        
+        # ===========================================================
+        # Phase 3: Fine-tune entire model with prompts
+        # ===========================================================
+        print("=== Phase 3: Fine-tuning entire model with prompts ===")
+        
+        # Get the frozen_prompt_count from args
+        frozen_count = getattr(args, 'frozen_prompt_count', 1024)
+        
+        # Unfreeze all parameters (except those that should remain frozen)
+        for name, param in self.named_parameters():
+            # Don't unfreeze frozen prompts (the first frozen_count prompts)
+            if name.startswith('prompt_bank.prompts'):
+                prompt_idx = int(name.split('.')[2]) if len(name.split('.')) > 2 else -1
+                if prompt_idx >= 0 and prompt_idx < frozen_count:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+            else:
+                param.requires_grad = True
+        
+        # Re-apply hybrid prompt freezing to ensure correct gradient masking
+        self.ensure_hybrid_prompt_freezing()
+        
+        # Create optimizer with lower learning rate
+        phase3_lr = args.lr * 0.01  # Very low learning rate for fine-tuning
+        phase3_optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=phase3_lr, betas=(0.9, 0.98)
+        )
+        
+        # Train Phase 3
+        for epoch in range(1, phase3_epochs + 1):
+            total_loss = 0
+            for step in range(num_batch):
+                u, seq, pos, neg = sampler.next_batch()
+                
+                phase3_optimizer.zero_grad()
+                loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase3_optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # Evaluate after each epoch or at specified intervals
+            if epoch % args.print_freq == 0 or epoch == phase3_epochs:
+                avg_loss = total_loss / num_batch
+                ndcg, hr = evaluate(self, eval_data, args, device)
+                print(f"[Phase 3 epoch {epoch}/{phase3_epochs}] NDCG={ndcg:.4f}, HR={hr:.4f}, Loss={avg_loss:.4f}")
+        
+        # Close sampler
+        sampler.close()
+        
+        # Return final performance metrics
+        final_ndcg, final_hr = evaluate(self, eval_data, args, device)
+        return final_ndcg, final_hr
     
 class EnsemblePromptSASRec(nn.Module):
     """
@@ -746,6 +921,70 @@ class EnsemblePromptSASRec(nn.Module):
             
             # Weighted combination
             combined_scores = self.alpha * frozen_scores + (1 - self.alpha) * incremental_scores
+            
+        return combined_scores
+        
+    def forward(self, u, seq, pos, neg, is_training=True):
+        """
+        For training, only update incremental model
+        """
+        return self.incremental_model(u, seq, pos, neg, is_training=is_training)
+    
+
+class EnhancedEnsemblePromptSASRec(nn.Module):
+    """
+    Enhanced ensemble model that adaptively combines predictions from a frozen T1 model
+    and an incrementally trained model based on item characteristics
+    """
+    def __init__(self, frozen_t1_model, incremental_model, default_alpha=0.3):
+        super(EnhancedEnsemblePromptSASRec, self).__init__()
+        self.frozen_t1_model = frozen_t1_model
+        self.incremental_model = incremental_model
+        self.default_alpha = default_alpha  # Default weight for the frozen model (0-1)
+        
+        # Ensure frozen model stays frozen
+        for param in self.frozen_t1_model.parameters():
+            param.requires_grad = False
+            
+        # Reference to device for consistency
+        self.dev = incremental_model.dev
+        
+        # Get item sets from incremental model
+        self.seen_items = incremental_model.seen_items if hasattr(incremental_model, 'seen_items') else set()
+        self.new_items = incremental_model.new_items if hasattr(incremental_model, 'new_items') else set()
+        
+    def predict(self, u, seq, item_idx):
+        """
+        Make ensemble predictions using both models with adaptive weighting
+        
+        Args:
+            u: User indices
+            seq: Sequence of items
+            item_idx: Items to score
+        """
+        # Get predictions from both models
+        with torch.no_grad():
+            frozen_scores = self.frozen_t1_model.predict(u, seq, item_idx)
+            incremental_scores = self.incremental_model.predict(u, seq, item_idx)
+            
+            # Create item-specific alpha values
+            alphas = torch.ones_like(frozen_scores) * self.default_alpha
+            
+            # Adjust alpha based on item characteristics
+            for batch_idx in range(item_idx.size(0)):
+                for item_pos in range(item_idx.size(1)):
+                    item = item_idx[batch_idx, item_pos].item()
+                    
+                    if item in self.seen_items:
+                        # Old items from T1: higher weight for frozen model
+                        alphas[batch_idx, item_pos] = 0.7
+                    elif item in self.new_items:
+                        # New items from incremental slices: lower weight for frozen model
+                        alphas[batch_idx, item_pos] = 0.1
+                    # Otherwise, use default alpha for unseen items
+            
+            # Weighted combination
+            combined_scores = alphas * frozen_scores + (1 - alphas) * incremental_scores
             
         return combined_scores
         

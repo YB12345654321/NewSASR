@@ -59,6 +59,8 @@ parser.add_argument('--extract_prompts', action='store_true', help='Extract prom
 parser.add_argument('--prompt_layer_idx', default=0, type=int, help='Layer index to extract prompts from')
 parser.add_argument('--freeze_prompts', action='store_true', help='Freeze prompts after initial training')
 parser.add_argument('--num_new_prompts', default=4, type=int, help='Number of new prompts to be added in each epoch')
+parser.add_argument('--frozen_prompt_count', default=1024, type=int, 
+                    help='Number of prompts to keep frozen during incremental learning')
 
 def set_seed(seed):
     """
@@ -423,8 +425,7 @@ def freeze_prompts(model, freeze=True):
 
 def run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file):
     """
-    Run prompt-based incremental learning experiment with hybrid prompt freezing
-    and ensemble modeling for forgetting mitigation
+    Run prompt-based incremental learning experiment with three-phase training for each slice
     """
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -525,6 +526,27 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
         
         # Update item sets for prompt manager
         prompt_manager.update_item_sets(t1_items, slice_items)
+
+        # Create new replay buffer for this slice
+        slice_buffer = time_data.create_replay_buffer(slice_idx, args.buffer_size, max_seq_length=1)
+        replay_buffer.update_buffer(slice_buffer)
+
+        # Determine number of epochs for each phase
+        inc_epochs_total = args.num_epochs // 4  # Fewer epochs for incremental learning
+        phase1_epochs = inc_epochs_total // 3
+        phase2_epochs = inc_epochs_total // 3
+        phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs
+        
+        # ====================================================================
+        # PHASE 1: Train base model with minimal prompt influence
+        # ====================================================================
+        print(f"=== Phase 1: Training on slice {slice_idx} with minimal prompt influence ===")
+        
+        # Store original prompt_mix_ratio
+        original_mix_ratio = prompt_model.prompt_mix_ratio
+        
+        # Set a very low mix ratio for Phase 1
+        prompt_model.prompt_mix_ratio = 0.05
         
         # Create sampler for this slice
         slice_sampler = WarpSampler(slice_user_train, usernum, itemnum,
@@ -533,22 +555,15 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                                   threshold_item=args.threshold_item,
                                   n_workers=3, device=device)
         
-        # Create optimizer - all parameters are included, but gradients will be masked for frozen prompts
-        inc_lr = args.lr * 0.1  # Lower learning rate for stability
-        inc_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=inc_lr, betas=(0.9, 0.98))
+        # Create optimizer for all parameters
+        phase1_lr = args.lr * 0.1  # Lower learning rate for incremental learning
+        phase1_optimizer = torch.optim.Adam(prompt_model.parameters(), lr=phase1_lr, betas=(0.9, 0.98))
         
-        # Create new replay buffer for this slice
-        slice_buffer = time_data.create_replay_buffer(slice_idx, args.buffer_size, max_seq_length=1)
-        replay_buffer.update_buffer(slice_buffer)
-        
-        # Train for fewer epochs
-        inc_epochs = args.num_epochs // 4  # Fewer epochs for incremental learning
+        # Determine number of batches
+        num_batch = max(len(slice_user_train) // args.batch_size, 1)
         t0 = time.time()
-
-        for epoch in range(1, inc_epochs + 1):
-            # Determine number of batches
-            num_batch = max(len(slice_user_train) // args.batch_size, 1)
-            
+        
+        for epoch in range(1, phase1_epochs + 1):
             for step in range(num_batch):
                 # Get batch from current slice
                 u, seq, pos, neg = slice_sampler.next_batch()
@@ -607,11 +622,11 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                         pos = torch.cat([pos, r_poss_tensor])
                         neg = torch.cat([neg, r_negs_tensor])
                 
-                # Update model without knowledge distillation from base model
-                inc_optimizer.zero_grad()
-                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True, base_model=None)
+                # Update model
+                phase1_optimizer.zero_grad()
+                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True)
                 loss.backward()
-                inc_optimizer.step()
+                phase1_optimizer.step()
             
             if epoch % args.print_freq == 0:
                 t1 = time.time() - t0
@@ -619,11 +634,222 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 # Evaluate on current slice
                 if check_dataset_validity(slice_data):
                     t_test = evaluate(prompt_model, slice_data, args, device)
-                    log_file.write(f"Slice {slice_idx}, epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
+                    log_file.write(f"[Slice {slice_idx}, Phase 1, epoch {epoch}]: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
                     log_file.flush()
-                    print(f"[Slice {slice_idx}, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
+                    print(f"[Slice {slice_idx}, Phase 1, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
                 else:
-                    print(f"[Slice {slice_idx}, epoch {epoch}] No valid test users found. Skipping.")
+                    print(f"[Slice {slice_idx}, Phase 1, epoch {epoch}] No valid test users found. Skipping.")
+                
+                t0 = time.time()
+        
+        # ====================================================================
+        # PHASE 2: Train prompts with frozen base model
+        # ====================================================================
+        print(f"=== Phase 2: Training prompts for slice {slice_idx} with base model frozen ===")
+        
+        # Restore original prompt mixing ratio
+        prompt_model.prompt_mix_ratio = original_mix_ratio
+        
+        # Freeze all non-prompt parameters
+        for name, param in prompt_model.named_parameters():
+            if 'prompt_bank' not in name:
+                param.requires_grad = False
+        
+        # Create optimizer for prompt parameters only
+        phase2_lr = args.lr * 0.05  # Even lower learning rate for prompt specialization
+        phase2_optimizer = torch.optim.Adam(
+            prompt_model.prompt_bank.parameters(),
+            lr=phase2_lr, betas=(0.9, 0.98)
+        )
+        
+        t0 = time.time()
+        
+        for epoch in range(1, phase2_epochs + 1):
+            for step in range(num_batch):
+                # Get batch from current slice
+                u, seq, pos, neg = slice_sampler.next_batch()
+                
+                # Optionally mix with replay samples (same code as before)
+                if random.random() < args.replay_ratio and replay_buffer.buffer:
+                    replay_batch = replay_buffer.sample_batch(args.batch_size)
+                    if replay_batch:
+                        r_users, r_seqs, r_poss, r_negs = replay_batch
+                        
+                        # Convert all to numpy arrays first
+                        r_users_array = np.array(r_users)
+                        r_poss_array = np.array(r_poss)
+                        r_negs_array = np.array(r_negs)
+                        
+                        # Pad sequences properly
+                        padded_seqs = np.zeros((len(r_seqs), args.maxlen), dtype=np.int64)
+                        for i, seq_item in enumerate(r_seqs):
+                            # Make sure we handle it as a sequence
+                            if not isinstance(seq_item, (list, np.ndarray)):
+                                seq_item = [seq_item]
+                            
+                            # Place at the end of the padded sequence
+                            seq_length = min(len(seq_item), args.maxlen)
+                            if seq_length > 0:
+                                padded_seqs[i, args.maxlen - seq_length:] = np.array(seq_item[-seq_length:])
+                        
+                        # Get the shapes of the original tensors for proper reshaping
+                        u_shape = u.shape
+                        seq_shape = seq.shape
+                        pos_shape = pos.shape
+                        neg_shape = neg.shape
+                        
+                        # Convert to tensors, ensuring they have the right dtype and shape
+                        r_users_tensor = torch.tensor(r_users_array, dtype=torch.long, device=device)
+                        r_seqs_tensor = torch.tensor(padded_seqs, dtype=torch.long, device=device)
+                        
+                        # Reshape pos and neg to match the original tensors
+                        if len(pos_shape) > 1:  # If pos is 2D
+                            # Reshape to match (batch_size, maxlen) if that's the shape
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            
+                            # Expand to match maxlen if needed
+                            if pos_shape[1] > 1:
+                                r_poss_tensor = r_poss_tensor.expand(-1, pos_shape[1])
+                                r_negs_tensor = r_negs_tensor.expand(-1, neg_shape[1])
+                        else:
+                            # If pos is 1D, keep it 1D
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device)
+                        
+                        # Combine current and replay
+                        u = torch.cat([u, r_users_tensor])
+                        seq = torch.cat([seq, r_seqs_tensor])
+                        pos = torch.cat([pos, r_poss_tensor])
+                        neg = torch.cat([neg, r_negs_tensor])
+                
+                # Update model
+                phase2_optimizer.zero_grad()
+                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase2_optimizer.step()
+            
+            if epoch % args.print_freq == 0:
+                t1 = time.time() - t0
+                
+                # Evaluate on current slice
+                if check_dataset_validity(slice_data):
+                    t_test = evaluate(prompt_model, slice_data, args, device)
+                    log_file.write(f"[Slice {slice_idx}, Phase 2, epoch {epoch}]: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
+                    log_file.flush()
+                    print(f"[Slice {slice_idx}, Phase 2, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
+                else:
+                    print(f"[Slice {slice_idx}, Phase 2, epoch {epoch}] No valid test users found. Skipping.")
+                
+                t0 = time.time()
+        
+        # ====================================================================
+        # PHASE 3: Fine-tune entire model
+        # ====================================================================
+        print(f"=== Phase 3: Fine-tuning all parameters for slice {slice_idx} ===")
+        
+        # Get the frozen_prompt_count
+        frozen_count = getattr(args, 'frozen_prompt_count', 1024)
+        
+        # Unfreeze all parameters except permanently frozen prompts
+        for name, param in prompt_model.named_parameters():
+            # Don't unfreeze parameters that should be permanently frozen
+            if name.startswith('prompt_bank.prompts'):
+                prompt_idx = int(name.split('.')[2]) if len(name.split('.')) > 2 else -1
+                if prompt_idx >= 0 and prompt_idx < frozen_count:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+            else:
+                param.requires_grad = True
+        
+        # Reapply hybrid prompt freezing to ensure correct gradient masking
+        prompt_model.ensure_hybrid_prompt_freezing()
+        # Create optimizer with very low learning rate
+        phase3_lr = args.lr * 0.01  # Very low learning rate for fine-tuning
+        phase3_optimizer = torch.optim.Adam(
+            [p for p in prompt_model.parameters() if p.requires_grad],
+            lr=phase3_lr, betas=(0.9, 0.98)
+        )
+        
+        t0 = time.time()
+        
+        for epoch in range(1, phase3_epochs + 1):
+            for step in range(num_batch):
+                # Get batch from current slice
+                u, seq, pos, neg = slice_sampler.next_batch()
+                
+                # Optionally mix with replay samples (same code as before)
+                if random.random() < args.replay_ratio and replay_buffer.buffer:
+                    replay_batch = replay_buffer.sample_batch(args.batch_size)
+                    if replay_batch:
+                        r_users, r_seqs, r_poss, r_negs = replay_batch
+                        
+                        # Convert all to numpy arrays first
+                        r_users_array = np.array(r_users)
+                        r_poss_array = np.array(r_poss)
+                        r_negs_array = np.array(r_negs)
+                        
+                        # Pad sequences properly
+                        padded_seqs = np.zeros((len(r_seqs), args.maxlen), dtype=np.int64)
+                        for i, seq_item in enumerate(r_seqs):
+                            # Make sure we handle it as a sequence
+                            if not isinstance(seq_item, (list, np.ndarray)):
+                                seq_item = [seq_item]
+                            
+                            # Place at the end of the padded sequence
+                            seq_length = min(len(seq_item), args.maxlen)
+                            if seq_length > 0:
+                                padded_seqs[i, args.maxlen - seq_length:] = np.array(seq_item[-seq_length:])
+                        
+                        # Get the shapes of the original tensors for proper reshaping
+                        u_shape = u.shape
+                        seq_shape = seq.shape
+                        pos_shape = pos.shape
+                        neg_shape = neg.shape
+                        
+                        # Convert to tensors, ensuring they have the right dtype and shape
+                        r_users_tensor = torch.tensor(r_users_array, dtype=torch.long, device=device)
+                        r_seqs_tensor = torch.tensor(padded_seqs, dtype=torch.long, device=device)
+                        
+                        # Reshape pos and neg to match the original tensors
+                        if len(pos_shape) > 1:  # If pos is 2D
+                            # Reshape to match (batch_size, maxlen) if that's the shape
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device).reshape(-1, 1)
+                            
+                            # Expand to match maxlen if needed
+                            if pos_shape[1] > 1:
+                                r_poss_tensor = r_poss_tensor.expand(-1, pos_shape[1])
+                                r_negs_tensor = r_negs_tensor.expand(-1, neg_shape[1])
+                        else:
+                            # If pos is 1D, keep it 1D
+                            r_poss_tensor = torch.tensor(r_poss_array, dtype=torch.long, device=device)
+                            r_negs_tensor = torch.tensor(r_negs_array, dtype=torch.long, device=device)
+                        
+                        # Combine current and replay
+                        u = torch.cat([u, r_users_tensor])
+                        seq = torch.cat([seq, r_seqs_tensor])
+                        pos = torch.cat([pos, r_poss_tensor])
+                        neg = torch.cat([neg, r_negs_tensor])
+                
+                # Update model
+                phase3_optimizer.zero_grad()
+                loss, _, auc, _ = prompt_model(u, seq, pos, neg, is_training=True)
+                loss.backward()
+                phase3_optimizer.step()
+            
+            if epoch % args.print_freq == 0:
+                t1 = time.time() - t0
+                
+                # Evaluate on current slice
+                if check_dataset_validity(slice_data):
+                    t_test = evaluate(prompt_model, slice_data, args, device)
+                    log_file.write(f"[Slice {slice_idx}, Phase 3, epoch {epoch}]: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
+                    log_file.flush()
+                    print(f"[Slice {slice_idx}, Phase 3, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
+                else:
+                    print(f"[Slice {slice_idx}, Phase 3, epoch {epoch}] No valid test users found. Skipping.")
                 
                 t0 = time.time()
         
@@ -651,7 +877,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                 results['prompt_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': 0.0, 'hr': 0.0}
                 print(f"Prompt model on slice {i}: No valid test users found. Skipping.")
 
-        # Create the ensemble model to mitigate catastrophic forgetting
+        # Create the ensemble model with adaptive weighting
         ensemble_model = EnsemblePromptSASRec(frozen_t1_model, prompt_model, alpha=0.2)
         
         # Save ensemble model
@@ -807,8 +1033,8 @@ def run_comparison(args):
     print("\n=== Running Standard Incremental Learning ===")
     results_incremental, base_model, t1_items = run_incremental_learning(args, time_data, output_dir, log_file)
     
-    # Run prompt-based incremental learning
-    print("\n=== Running Prompt-Based Incremental Learning ===")
+    # Run prompt-based incremental learning with three-phase approach
+    print("\n=== Running Prompt-Based Incremental Learning with Three-Phase Approach ===")
     results_prompt = run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file)
     
     # Compare results
@@ -819,7 +1045,6 @@ def run_comparison(args):
     
     print("\n=== Comparison Completed ===")
     print(f"Results saved to {output_dir}")
-
 
 def generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file):
     """
