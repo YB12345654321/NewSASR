@@ -82,11 +82,20 @@ def check_dataset_validity(dataset):
     Check if dataset has valid test users
     """
     [train, valid, test, usernum, itemnum] = dataset
+    
+    # Check for valid test users
     valid_test_users = []
-    for u in train:
-        if u in test and len(test[u]) > 0 and len(train[u]) > 0:
+    for u in test:
+        if len(test[u]) > 0 and u in train and len(train[u]) > 0:
             valid_test_users.append(u)
-    return len(valid_test_users) > 0
+    
+    # Check for valid validation users
+    valid_valid_users = []
+    for u in valid:
+        if len(valid[u]) > 0 and u in train and len(train[u]) > 0:
+            valid_valid_users.append(u)
+    
+    return len(valid_test_users) > 0 or len(valid_valid_users) > 0
 
 def prepare_time_sliced_data(args, output_dir):
     """

@@ -37,16 +37,17 @@ def data_partition(fname):
             user_test[user].append(User[user][-1])
     return [user_train, user_valid, user_test, usernum, itemnum]
 
+
 def evaluate(model, dataset, args, device='cuda'):
     model.eval()
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
-    # print(test)
+    
     NDCG = 0.0
     HT = 0.0
     valid_user = 0.0
 
-    # Get the list of existing users, instead of assuming sequential IDs
-    all_users = list(train.keys())
+    # Evaluate on test users
+    all_users = list(test.keys())
     if len(all_users) > 10000:
         users = random.sample(all_users, 10000)
     else:
@@ -55,26 +56,14 @@ def evaluate(model, dataset, args, device='cuda'):
     with torch.no_grad():
         user_num = 0
         for u in users:
-            user_num+=1
-            if u not in train or u not in test or len(train[u]) < 1 or len(test[u]) < 1: 
-                print(user_num, 'no training data or test data')
-                if u not in train:
-                    print('not in train')
-                if u not in test:
-                    print('not in test')
-                # if len(train[u])<1:
-                #     print('not train data')
-                # if len(test[u])<1:
-                #     print('no test data')
+            user_num += 1
+            if u not in train or len(train[u]) < 1 or len(test[u]) < 1: 
                 continue
 
             seq = np.zeros([args.maxlen], dtype=np.int64)
             idx = args.maxlen - 1
             
-            if u in valid and len(valid[u]) > 0:
-                seq[idx] = valid[u][0]
-                idx -= 1
-                
+            # Get the training sequence for this test user
             for i in reversed(train[u]):
                 seq[idx] = i
                 idx -= 1
@@ -82,7 +71,7 @@ def evaluate(model, dataset, args, device='cuda'):
 
             rated = set(train[u])
             rated.add(0)
-            item_idx = [test[u][0]]
+            item_idx = [test[u][0]]  # The ground truth item
             for _ in range(100):
                 t = np.random.randint(1, itemnum + 1)
                 while t in rated: 
@@ -95,7 +84,6 @@ def evaluate(model, dataset, args, device='cuda'):
             
             dummy_user = torch.zeros_like(u_tensor).to(device)
             predictions = -model.predict(dummy_user, seq, item_idx)
-            # predictions = -model.predict(u_tensor, seq, item_idx)
             predictions = predictions[0]
             rank = (-predictions).argsort().argsort()[0].item()
 
@@ -114,6 +102,67 @@ def evaluate(model, dataset, args, device='cuda'):
         return NDCG / valid_user, HT / valid_user
     else:
         return -0.01, -0.01
+
+def evaluate_valid(model, dataset, args, device='cuda'):
+    model.eval()
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    NDCG = 0.0
+    valid_user = 0.0
+    HT = 0.0
+    
+    # Evaluate on validation users (training users)
+    all_users = list(valid.keys())
+    if len(all_users) > 10000:
+        users = random.sample(all_users, 10000)
+    else:
+        users = all_users
+        
+    with torch.no_grad():
+        for u in users:
+            if u not in train or len(train[u]) < 1 or len(valid[u]) < 1: 
+                continue
+
+            seq = np.zeros([args.maxlen], dtype=np.int64)
+            idx = args.maxlen - 1
+            for i in reversed(train[u]):
+                seq[idx] = i
+                idx -= 1
+                if idx == -1: break
+
+            rated = set(train[u])
+            rated.add(0)
+            item_idx = [valid[u][0]]
+            for _ in range(100):
+                t = np.random.randint(1, itemnum + 1)
+                while t in rated: 
+                    t = np.random.randint(1, itemnum + 1)
+                item_idx.append(t)
+
+            seq = torch.LongTensor(seq).unsqueeze(0).to(device)
+            u_tensor = torch.LongTensor([u]).to(device)
+            item_idx = torch.LongTensor(item_idx).to(device)
+            
+            predictions = -model.predict(u_tensor, seq, item_idx)
+            predictions = predictions[0]
+
+            rank = (-predictions).argsort().argsort()[0].item()
+
+            valid_user += 1
+
+            if rank < args.k:
+                NDCG += 1 / np.log2(rank + 2)
+                HT += 1
+            if valid_user % 100 == 0:
+                sys.stdout.flush()
+
+    model.train()
+    
+    # Avoid division by zero
+    if valid_user > 0:
+        return NDCG / valid_user, HT / valid_user
+    else:
+        return 0.0, 0.0
 
 def evaluate_valid(model, dataset, args, device='cuda'):
     model.eval()

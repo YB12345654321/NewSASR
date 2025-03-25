@@ -22,6 +22,8 @@ class TimeSlicedData:
         self.usernum = 0
         self.itemnum = 0
         
+
+
     def load_data(self):
         """
         Load data and split into time slices based on user interaction length
@@ -47,30 +49,14 @@ class TimeSlicedData:
         for user in self.user_interactions:
             self.user_interactions[user].sort(key=lambda x: x[1])
         
-        # Print minimum interactions required for each slice
-        min_per_slice = [max(3, int(self.min_interactions * ratio / 0.1)) for ratio in self.slice_ratios]
+        # Minimum required interactions for a user to be considered
+        min_interactions = self.min_interactions
         print(f"Using slice ratios: {self.slice_ratios}")
-        print(f"Minimum interactions per slice: {min_per_slice}")
+        print(f"Minimum interactions required: {min_interactions}")
         
         # Filter out users with insufficient interactions
         for user, interactions in self.user_interactions.items():
-            total_interactions = len(interactions)
-            
-            # Check if each slice would have enough interactions
-            is_valid = True
-            for i, ratio in enumerate(self.slice_ratios):
-                # Calculate minimum required for this slice
-                adjusted_min = max(3, int(self.min_interactions * ratio / 0.1))
-                
-                # Calculate expected interactions in this slice
-                slice_interactions = int(total_interactions * ratio)
-                
-                # Check if this slice has enough interactions
-                if slice_interactions < adjusted_min:
-                    is_valid = False
-                    break
-            
-            if is_valid:
+            if len(interactions) >= min_interactions:
                 self.valid_users.add(user)
         
         print(f"Total users: {len(self.user_interactions)}, Valid users: {len(self.valid_users)}")
@@ -110,6 +96,7 @@ class TimeSlicedData:
             
         return self.time_slices
 
+
     def get_slice_data(self, slice_idx):
         """
         Get users and items from a specific slice
@@ -129,9 +116,11 @@ class TimeSlicedData:
         
         return set(), set()
     
+
+
     def prepare_slice(self, slice_idx, include_previous=False):
         """
-        Prepare a specific time slice for training
+        Prepare a specific time slice for training with 80/20 user split
         
         Args:
             slice_idx: Index of the time slice
@@ -158,24 +147,50 @@ class TimeSlicedData:
         user_items = defaultdict(list)
         for user, item, _ in interactions:
             user_items[user].append(item)
-            
-        # Split into train/valid/test
+        
+        # Split users into train (80%) and test (20%) sets
+        all_users = list(user_items.keys())
+        num_train_users = int(len(all_users) * 0.8)
+        
+        # Shuffle users and split
+        random.shuffle(all_users)
+        train_users = all_users[:num_train_users]
+        test_users = all_users[num_train_users:]
+        
+        # Initialize data structures
         user_train = {}
         user_valid = {}
         user_test = {}
         
-        for user, items in user_items.items():
-            if len(items) < 3:
+        # Process train users - use last item for validation
+        for user in train_users:
+            items = user_items[user]
+            if len(items) < 2:
+                # If too few items, just use for training
                 user_train[user] = items
                 user_valid[user] = []
                 user_test[user] = []
             else:
-                user_train[user] = items[:-2]
-                user_valid[user] = [items[-2]]
+                # Use all but last item for training, last item for validation
+                user_train[user] = items[:-1]
+                user_valid[user] = [items[-1]]
+                user_test[user] = []
+        
+        # Process test users - use last item for testing
+        for user in test_users:
+            items = user_items[user]
+            if len(items) < 2:
+                # If too few items, skip this user
+                continue
+            else:
+                # Use all but last item as known sequence, last item for testing
+                user_train[user] = items[:-1]
+                user_valid[user] = []
                 user_test[user] = [items[-1]]
         
         return [user_train, user_valid, user_test, self.usernum, self.itemnum]
-    
+
+
     def create_replay_buffer(self, slice_idx, buffer_size=1000, max_seq_length=1):
         """
         Create a replay buffer of representative samples from a slice with fixed sequence length
@@ -212,9 +227,10 @@ class TimeSlicedData:
             
             # For sequences of exact length max_seq_length
             if len(seq) > max_seq_length:
-                # Take the last max_seq_length items for the sequence
-                pos = seq[max_seq_length]
-                seq_sample = seq[max(0, max_seq_length-1):max_seq_length]
+                # Take the last item as positive sample
+                pos = seq[-1]
+                # Take the sequence before the last item
+                seq_sample = seq[max(0, len(seq)-max_seq_length-1):-1]
                 
                 # Generate negative item
                 neg = random.randint(1, self.itemnum)
@@ -228,7 +244,7 @@ class TimeSlicedData:
                 return buffer
         
         return buffer
-    
+
 class ExperienceReplay:
     """
     Manages experience replay for incremental learning
