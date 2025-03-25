@@ -1065,69 +1065,43 @@ def run_comparison(args):
     print("\n=== Comparison Completed ===")
     print(f"Results saved to {output_dir}")
 
+
 def generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file):
     """
-    Generate a detailed comparison of model performance after each training slice
+    Generate a simplified comparison of model performance after each training slice
     """
     print("\n=== Detailed Slice-by-Slice Comparison ===")
     log_file.write("\n=== Detailed Slice-by-Slice Comparison ===\n")
     
-    # For each training slice (except T1 which is the base)
-    for train_slice in range(1, args.num_slices):
+    # For each training slice (starting from 0)
+    for train_slice in range(args.num_slices):
+        # Create table header
         comparison_table = f"\n=== After Training on Slice {train_slice} (T{train_slice+1}) ===\n"
-        comparison_table += "Test Slice\tIncremental NDCG\tPrompt NDCG\tNDCG Diff\tIncremental HR\tPrompt HR\tHR Diff\n"
-        comparison_table += "-" * 100 + "\n"
+        comparison_table += "Test Slice\tIncremental NDCG\tEnsemble NDCG\tIncremental HR\tEnsemble HR\n"
         
-        # Evaluate performance on all slices
-        avg_inc_ndcg = 0.0
-        avg_prompt_ndcg = 0.0
-        avg_inc_hr = 0.0
-        avg_prompt_hr = 0.0
-        
+        # Add rows for each test slice
         for test_slice in range(args.num_slices):
-            # Get results for this training-testing combination
-            inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg']
-            inc_hr = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr']
-            
-            prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg']
-            prompt_hr = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr']
-            
-            # Calculate differences
-            ndcg_diff = prompt_ndcg - inc_ndcg
-            hr_diff = prompt_hr - inc_hr
-            
-            # Add to averages
-            avg_inc_ndcg += inc_ndcg
-            avg_prompt_ndcg += prompt_ndcg
-            avg_inc_hr += inc_hr
-            avg_prompt_hr += prompt_hr
-            
-            # Add row to table
-            comparison_table += f"T{test_slice+1}\t{inc_ndcg:.4f}\t{prompt_ndcg:.4f}\t{ndcg_diff:+.4f}\t{inc_hr:.4f}\t{prompt_hr:.4f}\t{hr_diff:+.4f}\n"
-        
-        # Calculate averages
-        avg_inc_ndcg /= args.num_slices
-        avg_prompt_ndcg /= args.num_slices
-        avg_inc_hr /= args.num_slices
-        avg_prompt_hr /= args.num_slices
-        
-        # Add average row
-        comparison_table += "-" * 100 + "\n"
-        comparison_table += f"Avg\t{avg_inc_ndcg:.4f}\t{avg_prompt_ndcg:.4f}\t{avg_prompt_ndcg-avg_inc_ndcg:+.4f}\t{avg_inc_hr:.4f}\t{avg_prompt_hr:.4f}\t{avg_prompt_hr-avg_inc_hr:+.4f}\n"
-        
-        # Add specific analysis
-        # Knowledge retention (T1 performance)
-        t1_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_0']['ndcg']
-        t1_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_0']['ndcg']
-        t1_base_ndcg = results_incremental['base_model']['slice_0']['ndcg']
-        
-        comparison_table += f"\nKnowledge Retention (T1): Incremental={t1_inc_ndcg:.4f}, Prompt={t1_prompt_ndcg:.4f}, Diff={t1_prompt_ndcg-t1_inc_ndcg:+.4f}\n"
-        
-        # New knowledge acquisition (performance on current slice)
-        current_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{train_slice}']['ndcg']
-        current_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_{train_slice}']['ndcg']
-        
-        comparison_table += f"New Knowledge (T{train_slice+1}): Incremental={current_inc_ndcg:.4f}, Prompt={current_prompt_ndcg:.4f}, Diff={current_prompt_ndcg-current_inc_ndcg:+.4f}\n"
+            # For slice 0 (base model), handle differently
+            if train_slice == 0:
+                # Use base model results for the first slice
+                base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
+                base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
+                # For ensemble, use base model result for all slices in the first iteration
+                ensemble_ndcg = base_ndcg  # Use base model values for ensemble
+                ensemble_hr = base_hr      # Use base model values for ensemble
+                
+                comparison_table += f"T{test_slice}\t{base_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{base_hr:.4f}\t{ensemble_hr:.4f}\n"
+                
+            else:
+                # Get results for incremental model
+                inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
+                inc_hr = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
+                
+                # Get results for ensemble model
+                ensemble_ndcg = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
+                ensemble_hr = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
+                
+                comparison_table += f"T{test_slice}\t{inc_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{inc_hr:.4f}\t{ensemble_hr:.4f}\n"
         
         # Print and log
         print(comparison_table)
@@ -1136,36 +1110,8 @@ def generate_detailed_comparison(results_incremental, results_prompt, args, outp
         # Save to individual file
         with open(os.path.join(output_dir, f'comparison_after_slice_{train_slice}.txt'), 'w') as f:
             f.write(comparison_table)
-    
-    # Create a summary of retention vs acquisition
-    retention_table = "\n=== Summary: Knowledge Retention vs. Acquisition ===\n"
-    retention_table += "Slice\tRetention (T1)\t\t\tAcquisition (Current)\n"
-    retention_table += "\tIncr.\tPrompt\tDiff\tIncr.\tPrompt\tDiff\n"
-    retention_table += "-" * 70 + "\n"
-    
-    for train_slice in range(1, args.num_slices):
-        # Get retention (T1) performance
-        t1_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_0']['ndcg']
-        t1_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_0']['ndcg']
-        retention_diff = t1_prompt_ndcg - t1_inc_ndcg
-        
-        # Get acquisition (current slice) performance
-        current_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{train_slice}']['ndcg']
-        current_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{train_slice}_eval_on_{train_slice}']['ndcg']
-        acquisition_diff = current_prompt_ndcg - current_inc_ndcg
-        
-        # Add row
-        retention_table += f"T{train_slice+1}\t{t1_inc_ndcg:.4f}\t{t1_prompt_ndcg:.4f}\t{retention_diff:+.4f}\t{current_inc_ndcg:.4f}\t{current_prompt_ndcg:.4f}\t{acquisition_diff:+.4f}\n"
-    
-    # Print and log
-    print(retention_table)
-    log_file.write(retention_table)
-    
-    # Save to file
-    with open(os.path.join(output_dir, 'retention_vs_acquisition_summary.txt'), 'w') as f:
-        f.write(retention_table)
 
-
+            
 def main():
     args = parser.parse_args()
     
