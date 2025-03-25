@@ -93,7 +93,9 @@ def evaluate(model, dataset, args, device='cuda'):
             u_tensor = torch.LongTensor([u]).to(device)
             item_idx = torch.LongTensor(item_idx).to(device)
             
-            predictions = -model.predict(u_tensor, seq, item_idx)
+            dummy_user = torch.zeros_like(u_tensor).to(device)
+            predictions = -model.predict(dummy_user, seq, item_idx)
+            # predictions = -model.predict(u_tensor, seq, item_idx)
             predictions = predictions[0]
             rank = (-predictions).argsort().argsort()[0].item()
 

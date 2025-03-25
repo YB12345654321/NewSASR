@@ -89,7 +89,7 @@ class WarpSampler(object):
         user, seq, pos, neg = batch
         
         # Convert lists of arrays to single numpy arrays
-        user = np.array(user)
+        user = np.zeros_like(np.array(user)) 
         seq = np.array(seq)
         pos = np.array(pos)
         neg = np.array(neg)

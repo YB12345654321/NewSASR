@@ -120,11 +120,12 @@ class PromptManager:
                 pos_emb = self.prompt_model.pos_emb(pos_ids)
                 
                 # User encoding
-                u_emb = self.prompt_model.user_emb(u_tensor)
-                u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
+                # u_emb = self.prompt_model.user_emb(u_tensor)
+                # u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
                 
                 # Combine embeddings
-                seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                # seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                seq_repr = seq_emb
                 seq_repr += pos_emb
                 
                 # Get a summary of user's sequence for prompt selection

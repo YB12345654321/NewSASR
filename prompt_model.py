@@ -51,7 +51,7 @@ class PromptBaseSASRec(SASRec):
         super(PromptBaseSASRec, self).__init__(usernum, itemnum, args)
         
         # Define prompt dimensions
-        prompt_dim = args.item_hidden_units + args.user_hidden_units
+        prompt_dim = args.item_hidden_units # + args.user_hidden_units
         self.num_prompts = getattr(args, 'num_prompts', 8)
         
         # Create prompt bank
@@ -83,13 +83,14 @@ class PromptBaseSASRec(SASRec):
         pos_ids = pos_ids.unsqueeze(0).expand_as(seq)  # [B, L]
         pos_emb = self.pos_emb(pos_ids)  # [B, L, H_total]
         
-        # User encoding
-        u_emb = self.user_emb(u)  # [B, H_user]
-        u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)  # [B, L, H_user]
+        # # User encoding
+        # u_emb = self.user_emb(u)  # [B, H_user]
+        # u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)  # [B, L, H_user]
         
         # Combine embeddings
-        seq = torch.cat([seq_emb, u_emb_expand], dim=-1)  # [B, L, H_total]
-        seq += pos_emb
+        # seq = torch.cat([seq_emb, u_emb_expand], dim=-1)  # [B, L, H_total]
+        # seq += pos_emb
+        seq = seq_emb + pos_emb
         
         # Get a summary of user's sequence for prompt selection
         # Use the last position in the sequence as query vector
@@ -161,9 +162,9 @@ class PromptBaseSASRec(SASRec):
         neg_emb = self.item_emb(neg)  # [B*L, H_item]
         
         # Add user embeddings
-        user_emb = u_emb_expand.reshape(-1, u_emb.size(-1))  # [B*L, H_user]
-        pos_emb = torch.cat([pos_emb, user_emb], dim=1)  # [B*L, H_total]
-        neg_emb = torch.cat([neg_emb, user_emb], dim=1)  # [B*L, H_total]
+        # user_emb = u_emb_expand.reshape(-1, u_emb.size(-1))  # [B*L, H_user]
+        # pos_emb = torch.cat([pos_emb, user_emb], dim=1)  # [B*L, H_total]
+        # neg_emb = torch.cat([neg_emb, user_emb], dim=1)  # [B*L, H_total]
         
         # Compute logits
         pos_logits = torch.sum(pos_emb * seq, dim=-1)  # [B*L]
@@ -182,7 +183,7 @@ class PromptBaseSASRec(SASRec):
         if hasattr(self, 'args') and self.args.l2_emb > 0:
             l2_loss = self.args.l2_emb * (
                 torch.sum(self.item_emb.embedding.weight ** 2) +
-                torch.sum(self.user_emb.embedding.weight ** 2) +
+                # torch.sum(self.user_emb.embedding.weight ** 2) +
                 torch.sum(self.pos_emb.embedding.weight ** 2) +
                 torch.sum(self.prompt_bank.prompts ** 2)  # Also regularize prompts
             )
@@ -243,13 +244,13 @@ class PromptBaseSASRec(SASRec):
             pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
             pos_emb = self.pos_emb(pos_ids)
             
-            # User encoding
-            u_emb = self.user_emb(u)  # [B, H_user]
-            u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)  # [B, L, H_user]
+            # # User encoding
+            # u_emb = self.user_emb(u)  # [B, H_user]
+            # u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)  # [B, L, H_user]
             
             # Combine embeddings
-            seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)  # [B, L, H_total]
-            seq_repr += pos_emb
+            # seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)  # [B, L, H_total]
+            seq_repr = seq_emb+pos_emb
             
             # Get a summary of user's sequence for prompt selection
             # Use the last position in the sequence as query vector
@@ -302,13 +303,14 @@ class PromptBaseSASRec(SASRec):
             # Get test item embeddings
             test_item_emb = self.item_emb(item_idx)  # [N_items, H_item]
             
-            # Add user embeddings to test items
-            test_u_emb = u_emb.unsqueeze(1).expand(-1, test_item_emb.size(0), -1)  # [B, N_items, H_user]
-            test_item_emb = torch.cat([
-                test_item_emb.unsqueeze(0).expand(batch_size, -1, -1),  # [B, N_items, H_item]
-                test_u_emb  # [B, N_items, H_user]
-            ], dim=-1)  # [B, N_items, H_total]
-            
+            # # Add user embeddings to test items
+            # # test_u_emb = u_emb.unsqueeze(1).expand(-1, test_item_emb.size(0), -1)  # [B, N_items, H_user]
+            # test_item_emb = torch.cat([
+            #     test_item_emb.unsqueeze(0).expand(batch_size, -1, -1),  # [B, N_items, H_item]
+            #     test_u_emb  # [B, N_items, H_user]
+            # ], dim=-1)  # [B, N_items, H_total]
+            test_item_emb = test_item_emb.unsqueeze(0).expand(batch_size, -1, -1)  # [B, N_items, H_item]
+
             # Compute scores (make them negative since we want target items to have higher scores)
             scores = -torch.sum(seq_emb.unsqueeze(1) * test_item_emb, dim=-1)  # [B, N_items]
             
@@ -551,9 +553,9 @@ class PromptBaseSASRec(SASRec):
                 pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(device)
                 pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
                 pos_emb = self.pos_emb(pos_ids)
-                u_emb = self.user_emb(u)
-                u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
-                seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                # u_emb = self.user_emb(u)
+                # u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
+                seq_repr = seq_emb # torch.cat([seq_emb, u_emb_expand], dim=-1)
                 seq_repr += pos_emb
                 
                 # Get last valid position
@@ -634,9 +636,9 @@ class PromptBaseSASRec(SASRec):
                 pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(device)
                 pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
                 pos_emb = self.pos_emb(pos_ids)
-                u_emb = self.user_emb(u)
-                u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
-                seq_repr = torch.cat([seq_emb, u_emb_expand], dim=-1)
+                # u_emb = self.user_emb(u)
+                # u_emb_expand = u_emb.unsqueeze(1).expand(-1, seq.size(1), -1)
+                seq_repr = seq_emb # torch.cat([seq_emb, u_emb_expand], dim=-1)
                 seq_repr += pos_emb
                 
                 # Get query vectors

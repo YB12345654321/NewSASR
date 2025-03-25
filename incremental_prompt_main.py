@@ -26,7 +26,7 @@ parser.add_argument('--train_dir', default='default')
 parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--lr', default=0.001, type=float)
 parser.add_argument('--maxlen', default=50, type=int)
-parser.add_argument('--user_hidden_units', default=50, type=int)
+parser.add_argument('--user_hidden_units', default=0, type=int)
 parser.add_argument('--item_hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
 parser.add_argument('--num_epochs', default=20, type=int) # was 20
@@ -533,7 +533,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
 
         # Update this section in run_prompt_incremental_learning function
         # Determine number of epochs for each phase with optimized distribution
-        inc_epochs_total = args.num_epochs // 2  # Fewer epochs for incremental learning
+        inc_epochs_total = args.num_epochs // 1  # Fewer epochs for incremental learning
         phase1_epochs = int(inc_epochs_total * 0.3)  # 30% for Phase 1
         phase2_epochs = int(inc_epochs_total * 0.5)  # 50% for Phase 2
         phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs  # Remaining for Phase 3
