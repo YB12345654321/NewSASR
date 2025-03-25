@@ -26,7 +26,8 @@ class TimeSlicedData:
 
     def load_data(self):
         """
-        Load data and split into time slices based on user interaction length
+        Load data and split into time slices, filtering out items in later slices
+        that didn't appear in the first slice
         """
         # First, collect all user interactions
         with open(self.dataset_path, 'r') as f:
@@ -49,19 +50,16 @@ class TimeSlicedData:
         for user in self.user_interactions:
             self.user_interactions[user].sort(key=lambda x: x[1])
         
-        # Minimum required interactions for a user to be considered
-        min_interactions = self.min_interactions
-        print(f"Using slice ratios: {self.slice_ratios}")
-        print(f"Minimum interactions required: {min_interactions}")
-        
         # Filter out users with insufficient interactions
         for user, interactions in self.user_interactions.items():
-            if len(interactions) >= min_interactions:
+            if len(interactions) >= self.min_interactions:
                 self.valid_users.add(user)
         
         print(f"Total users: {len(self.user_interactions)}, Valid users: {len(self.valid_users)}")
         
-        # Split each valid user's interactions into slices
+        # First pass: Create temporary slices and identify items in first slice
+        temp_slices = [[] for _ in range(self.num_slices)]
+        
         for user in self.valid_users:
             interactions = self.user_interactions[user]
             total_interactions = len(interactions)
@@ -75,27 +73,45 @@ class TimeSlicedData:
                 boundaries.append(current_pos)
             boundaries.append(total_interactions)
             
-            # Assign interactions to slices
+            # Assign interactions to temporary slices
             for i in range(self.num_slices):
                 start_idx = boundaries[i]
                 end_idx = boundaries[i+1]
                 
-                # Add to corresponding slice
                 for idx in range(start_idx, end_idx):
                     item, timestamp = interactions[idx]
-                    self.time_slices[i].append((user, item, timestamp))
+                    temp_slices[i].append((user, item, timestamp))
         
-        # Sort each slice by timestamp (for global time ordering)
+        # Identify items in the first slice
+        self.first_slice_items = set([x[1] for x in temp_slices[0]])
+        print(f"Items in first slice: {len(self.first_slice_items)}")
+        
+        # Second pass: Filter out interactions with items not in first slice
+        filtered_slices = [[] for _ in range(self.num_slices)]
+        filtered_slices[0] = temp_slices[0]  # Keep all interactions in first slice
+        
+        total_removed = 0
+        for i in range(1, self.num_slices):
+            for user, item, timestamp in temp_slices[i]:
+                if item in self.first_slice_items:
+                    filtered_slices[i].append((user, item, timestamp))
+                else:
+                    total_removed += 1
+        
+        print(f"Removed {total_removed} interactions with items not in the first slice")
+        
+        # Sort each slice by timestamp and store
         for i in range(self.num_slices):
-            self.time_slices[i].sort(key=lambda x: x[2])
+            filtered_slices[i].sort(key=lambda x: x[2])
+            self.time_slices[i] = filtered_slices[i]
         
         # Print slice statistics
         for i in range(self.num_slices):
             slice_users = set([x[0] for x in self.time_slices[i]])
-            print(f"Slice {i}: {len(self.time_slices[i])} interactions, {len(slice_users)} users")
-            
+            slice_items = set([x[1] for x in self.time_slices[i]])
+            print(f"Slice {i}: {len(self.time_slices[i])} interactions, {len(slice_users)} users, {len(slice_items)} items")
+        
         return self.time_slices
-
 
     def get_slice_data(self, slice_idx):
         """
