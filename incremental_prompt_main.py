@@ -36,7 +36,7 @@ parser.add_argument('--threshold_user', default=1.0, type=float)
 parser.add_argument('--threshold_item', default=1.0, type=float)
 parser.add_argument('--l2_emb', default=0.0, type=float)
 parser.add_argument('--device', default='cuda', type=str)
-parser.add_argument('--print_freq', default=10, type=int)
+parser.add_argument('--print_freq', default=50, type=int)
 parser.add_argument('--k', default=10, type=int)
 
 # Incremental learning arguments
