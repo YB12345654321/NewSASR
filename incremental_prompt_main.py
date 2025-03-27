@@ -219,7 +219,8 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
             t1 = time.time() - t0
             
             if check_dataset_validity(t1_data):
-                t_test = evaluate(base_model, t1_data, args, device)
+                # 修改: 添加 first_slice_items 参数
+                t_test = evaluate(base_model, t1_data, args, device, first_slice_items=time_data.first_slice_items)
                 log_file.write(f"Base model epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
                 log_file.flush()
                 print(f"[Base model epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
@@ -264,7 +265,8 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     for i in range(args.num_slices):
         slice_data = time_data.prepare_slice(i, include_previous=False)
         if check_dataset_validity(slice_data):
-            ndcg, hr = evaluate(base_model, slice_data, args, device)
+            # 修改: 添加 first_slice_items 参数
+            ndcg, hr = evaluate(base_model, slice_data, args, device, first_slice_items=time_data.first_slice_items)
             results['base_model'][f'slice_{i}'] = {'ndcg': ndcg, 'hr': hr}
             print(f"Base model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}")
             log_file.write(f"Base model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}\n")
@@ -379,7 +381,8 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
                 
                 # Evaluate on current slice
                 if check_dataset_validity(slice_data):
-                    t_test = evaluate(incremental_model, slice_data, args, device)
+                    # 修改: 添加 first_slice_items 参数
+                    t_test = evaluate(incremental_model, slice_data, args, device, first_slice_items=time_data.first_slice_items)
                     log_file.write(f"Slice {slice_idx}, epoch {epoch}: NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}\n")
                     log_file.flush()
                     print(f"[Slice {slice_idx}, epoch {epoch}] NDCG={t_test[0]:.4f}, HR={t_test[1]:.4f}, Loss={loss:.4f}, Time={t1:.1f}s")
@@ -399,7 +402,8 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
         for i in range(args.num_slices):
             eval_data = time_data.prepare_slice(i, include_previous=False)
             if check_dataset_validity(eval_data):
-                ndcg, hr = evaluate(incremental_model, eval_data, args, device)
+                # 修改: 添加 first_slice_items 参数
+                ndcg, hr = evaluate(incremental_model, eval_data, args, device, first_slice_items=time_data.first_slice_items)
                 results['incremental_model'][f'after_slice_{slice_idx}_eval_on_{i}'] = {'ndcg': ndcg, 'hr': hr}
                 print(f"Incremental model on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}")
                 log_file.write(f"Incremental model (after slice {slice_idx}) on slice {i}: NDCG={ndcg:.4f}, HR={hr:.4f}\n")
@@ -414,8 +418,6 @@ def run_incremental_learning(args, time_data, output_dir, log_file):
     print("\n=== Incremental Learning Experiment Completed ===")
     
     return results, base_model, t1_items
-
-
 def freeze_prompts(model, freeze=True):
     """
     Freeze or unfreeze prompts

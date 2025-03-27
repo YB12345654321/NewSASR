@@ -37,8 +37,20 @@ def data_partition(fname):
             user_test[user].append(User[user][-1])
     return [user_train, user_valid, user_test, usernum, itemnum]
 
-
-def evaluate(model, dataset, args, device='cuda'):
+def evaluate(model, dataset, args, device='cuda', first_slice_items=None):
+    """
+    Evaluate model performance, optionally filtering out items not in the first slice
+    
+    Args:
+        model: Model to evaluate
+        dataset: Dataset in the format [user_train, user_valid, user_test, usernum, itemnum]
+        args: Command line arguments
+        device: Device to run evaluation on
+        first_slice_items: Set of items from the first slice (if None, all items are considered)
+        
+    Returns:
+        Tuple of (NDCG, HT) metrics
+    """
     model.eval()
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
     
@@ -59,6 +71,12 @@ def evaluate(model, dataset, args, device='cuda'):
             user_num += 1
             if u not in train or len(train[u]) < 1 or len(test[u]) < 1: 
                 continue
+                
+            # Check if test item is in the first slice (new filtering logic)
+            test_item = test[u][0]
+            if first_slice_items is not None and test_item not in first_slice_items:
+                # Skip evaluation for new items not in first slice
+                continue
 
             seq = np.zeros([args.maxlen], dtype=np.int64)
             idx = args.maxlen - 1
@@ -71,7 +89,7 @@ def evaluate(model, dataset, args, device='cuda'):
 
             rated = set(train[u])
             rated.add(0)
-            item_idx = [test[u][0]]  # The ground truth item
+            item_idx = [test_item]  # The ground truth item
             for _ in range(100):
                 t = np.random.randint(1, itemnum + 1)
                 while t in rated: 
@@ -82,8 +100,7 @@ def evaluate(model, dataset, args, device='cuda'):
             u_tensor = torch.LongTensor([u]).to(device)
             item_idx = torch.LongTensor(item_idx).to(device)
             
-            dummy_user = torch.zeros_like(u_tensor).to(device)
-            predictions = -model.predict(dummy_user, seq, item_idx)
+            predictions = -model.predict(u_tensor, seq, item_idx)
             predictions = predictions[0]
             rank = (-predictions).argsort().argsort()[0].item()
 
@@ -101,7 +118,7 @@ def evaluate(model, dataset, args, device='cuda'):
     if valid_user > 0:
         return NDCG / valid_user, HT / valid_user
     else:
-        return -0.01, -0.01
+        return 0.0, 0.0
 
 def evaluate_valid(model, dataset, args, device='cuda'):
     model.eval()
