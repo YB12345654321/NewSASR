@@ -925,32 +925,83 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     
     return results
 
+
 def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
     """
-    Compare results from both models
+    Compare results from incremental model and ensemble model
     
     Args:
         results_incremental: Results from incremental model
-        results_prompt: Results from prompt-based model
+        results_prompt: Results from prompt-based model (including ensemble model)
         args: Command line arguments
         output_dir: Output directory
         log_file: Log file object
     """
-    print("\n=== Comparing Incremental and Prompt-Based Models ===")
+    print("\n=== Comparing Incremental and Ensemble Models ===")
     log_file.write("\n=== Comparison Results ===\n")
     
     # Find the maximum slice index for which we have results
     max_slice = max([int(k.split('_')[2]) for k in results_incremental['incremental_model'].keys() 
                    if k.startswith('after_slice_')])
     
+    print(f"Maximum slice index: {max_slice}")
+    
+    # Get initial model performance (after training on the first slice)
+    # For incremental model, this is 'base_model' performance on T0
+    inc_initial_ndcg = None
+    if 'slice_0' in results_incremental['base_model']:
+        inc_initial_ndcg = results_incremental['base_model']['slice_0']['ndcg']
+    
+    # For ensemble model, find its performance after training on the first slice
+    ensemble_initial_ndcg = None
+    
+    # Try to get from ensemble_model, key format is usually 'after_slice_0_eval_on_0'
+    if 'ensemble_model' in results_prompt:
+        for key in results_prompt['ensemble_model'].keys():
+            if 'after_slice_0' in key and 'eval_on_0' in key:
+                ensemble_initial_ndcg = results_prompt['ensemble_model'][key]['ndcg']
+                break
+    
+    # If not found, try other possible keys
+    if ensemble_initial_ndcg is None and 'prompt_model' in results_prompt:
+        for key in results_prompt['prompt_model'].keys():
+            if 'slice_0' in key:
+                ensemble_initial_ndcg = results_prompt['prompt_model'][key]['ndcg']
+                break
+    
+    # Ensure we have initial values, if not, print warning and use reasonable substitutes
+    if inc_initial_ndcg is None:
+        print("Warning: Could not find initial performance for incremental model")
+        inc_initial_ndcg = 1.0  # Prevent division by zero
+    
+    if ensemble_initial_ndcg is None:
+        print("Warning: Could not find initial performance for ensemble model, will try to extract from detailed comparison")
+        # Try to extract from generate_detailed_comparison output
+        try:
+            with open(os.path.join(output_dir, 'comparison_after_slice_0.txt'), 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if 'T0' in line:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 3:
+                            ensemble_initial_ndcg = float(parts[2])
+                            print(f"Initial ensemble NDCG extracted from detailed comparison: {ensemble_initial_ndcg}")
+                            break
+        except:
+            print("Could not extract from detailed comparison, using incremental model's initial performance as substitute")
+            ensemble_initial_ndcg = inc_initial_ndcg
+    
+    print(f"Incremental model initial NDCG: {inc_initial_ndcg}")
+    print(f"Ensemble model initial NDCG: {ensemble_initial_ndcg}")
+    
     # Compare performance on each slice after training on final slice
-    comparison_table = "Slice\tBase NDCG\tBase HR\tIncremental NDCG\tIncremental HR\tPrompt NDCG\tPrompt HR\tNDCG Diff\tHR Diff\n"
+    comparison_table = "Slice\tBase NDCG\tBase HR\tIncremental NDCG\tIncremental HR\tEnsemble NDCG\tEnsemble HR\tNDCG Diff\tHR Diff\n"
     comparison_table += "-" * 100 + "\n"
     
     avg_inc_ndcg = 0.0
-    avg_prompt_ndcg = 0.0
+    avg_ensemble_ndcg = 0.0
     avg_inc_hr = 0.0
-    avg_prompt_hr = 0.0
+    avg_ensemble_hr = 0.0
     
     for i in range(args.num_slices):
         base_ndcg = results_incremental['base_model'][f'slice_{i}']['ndcg']
@@ -959,54 +1010,87 @@ def compare_results(results_incremental, results_prompt, args, output_dir, log_f
         inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{i}']['ndcg']
         inc_hr = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{i}']['hr']
         
-        prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{i}']['ndcg']
-        prompt_hr = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{i}']['hr']
+        # Use ensemble model results
+        ensemble_key = f'after_slice_{max_slice}_eval_on_{i}'
+        if 'ensemble_model' in results_prompt and ensemble_key in results_prompt['ensemble_model']:
+            ensemble_ndcg = results_prompt['ensemble_model'][ensemble_key]['ndcg']
+            ensemble_hr = results_prompt['ensemble_model'][ensemble_key]['hr']
+        else:
+            # If ensemble model results not found, use prompt model results
+            print(f"Warning: Ensemble model results not found for slice {i}, using prompt model results")
+            ensemble_ndcg = results_prompt['prompt_model'][ensemble_key]['ndcg']
+            ensemble_hr = results_prompt['prompt_model'][ensemble_key]['hr']
         
         # Calculate differences
-        ndcg_diff = prompt_ndcg - inc_ndcg
-        hr_diff = prompt_hr - inc_hr
+        ndcg_diff = ensemble_ndcg - inc_ndcg
+        hr_diff = ensemble_hr - inc_hr
         
         # Add to running averages
         avg_inc_ndcg += inc_ndcg
-        avg_prompt_ndcg += prompt_ndcg
+        avg_ensemble_ndcg += ensemble_ndcg
         avg_inc_hr += inc_hr
-        avg_prompt_hr += prompt_hr
+        avg_ensemble_hr += ensemble_hr
         
         # Add row to table
-        comparison_table += f"T{i+1}\t{base_ndcg:.4f}\t{base_hr:.4f}\t{inc_ndcg:.4f}\t{inc_hr:.4f}\t{prompt_ndcg:.4f}\t{prompt_hr:.4f}\t{ndcg_diff:+.4f}\t{hr_diff:+.4f}\n"
+        comparison_table += f"T{i+1}\t{base_ndcg:.4f}\t{base_hr:.4f}\t{inc_ndcg:.4f}\t{inc_hr:.4f}\t{ensemble_ndcg:.4f}\t{ensemble_hr:.4f}\t{ndcg_diff:+.4f}\t{hr_diff:+.4f}\n"
     
     # Calculate averages
     avg_inc_ndcg /= args.num_slices
-    avg_prompt_ndcg /= args.num_slices
+    avg_ensemble_ndcg /= args.num_slices
     avg_inc_hr /= args.num_slices
-    avg_prompt_hr /= args.num_slices
+    avg_ensemble_hr /= args.num_slices
     
     # Add averages to table
     comparison_table += "-" * 100 + "\n"
-    comparison_table += f"Avg\t-\t-\t{avg_inc_ndcg:.4f}\t{avg_inc_hr:.4f}\t{avg_prompt_ndcg:.4f}\t{avg_prompt_hr:.4f}\t{avg_prompt_ndcg-avg_inc_ndcg:+.4f}\t{avg_prompt_hr-avg_inc_hr:+.4f}\n"
+    comparison_table += f"Avg\t-\t-\t{avg_inc_ndcg:.4f}\t{avg_inc_hr:.4f}\t{avg_ensemble_ndcg:.4f}\t{avg_ensemble_hr:.4f}\t{avg_ensemble_ndcg-avg_inc_ndcg:+.4f}\t{avg_ensemble_hr-avg_inc_hr:+.4f}\n"
     
-    # Add performance on first slice (knowledge retention)
-    t1_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_0']['ndcg']
-    t1_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_0']['ndcg']
-    t1_base_ndcg = results_incremental['base_model']['slice_0']['ndcg']
+    # Now calculate retention rate
+    # Get final performance of both models on T0 after training on all slices
+    t1_inc_ndcg_final = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_0']['ndcg']
+    t1_inc_hr_final = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_0']['hr']
     
-    t1_inc_retention = t1_inc_ndcg / t1_base_ndcg if t1_base_ndcg > 0 else 0
-    t1_prompt_retention = t1_prompt_ndcg / t1_base_ndcg if t1_base_ndcg > 0 else 0
+    # Use ensemble model's final performance
+    t1_ensemble_key = f'after_slice_{max_slice}_eval_on_0'
+    if 'ensemble_model' in results_prompt and t1_ensemble_key in results_prompt['ensemble_model']:
+        t1_ensemble_ndcg_final = results_prompt['ensemble_model'][t1_ensemble_key]['ndcg']
+        t1_ensemble_hr_final = results_prompt['ensemble_model'][t1_ensemble_key]['hr']
+    else:
+        print(f"Warning: Final ensemble model results not found, using prompt model results")
+        t1_ensemble_ndcg_final = results_prompt['prompt_model'][t1_ensemble_key]['ndcg']
+        t1_ensemble_hr_final = results_prompt['prompt_model'][t1_ensemble_key]['hr']
+    
+    # Calculate retention rates - final performance divided by initial performance
+    t1_inc_retention = t1_inc_ndcg_final / inc_initial_ndcg if inc_initial_ndcg > 0 else 0
+    t1_ensemble_retention = t1_ensemble_ndcg_final / ensemble_initial_ndcg if ensemble_initial_ndcg > 0 else 0
+    
+    print(f"Incremental model final NDCG: {t1_inc_ndcg_final}")
+    print(f"Ensemble model final NDCG: {t1_ensemble_ndcg_final}")
+    
+    print(f"Calculated incremental model retention rate: {t1_inc_retention:.4f} ({t1_inc_retention:.2%})")
+    print(f"Calculated ensemble model retention rate: {t1_ensemble_retention:.4f} ({t1_ensemble_retention:.2%})")
     
     comparison_table += "\n=== Knowledge Retention (T1 Performance) ===\n"
     comparison_table += f"Incremental Model Retention: {t1_inc_retention:.2%}\n"
-    comparison_table += f"Prompt Model Retention: {t1_prompt_retention:.2%}\n"
-    comparison_table += f"Retention Improvement: {t1_prompt_retention - t1_inc_retention:+.2%}\n"
+    comparison_table += f"Ensemble Model Retention: {t1_ensemble_retention:.2%}\n"
+    comparison_table += f"Retention Improvement: {t1_ensemble_retention - t1_inc_retention:+.2%}\n"
     
     # Add performance on latest slice (new knowledge acquisition)
     latest_inc_ndcg = results_incremental['incremental_model'][f'after_slice_{max_slice}_eval_on_{max_slice}']['ndcg']
-    latest_prompt_ndcg = results_prompt['prompt_model'][f'after_slice_{max_slice}_eval_on_{max_slice}']['ndcg']
+    
+    # Use ensemble model performance on the latest slice
+    latest_ensemble_key = f'after_slice_{max_slice}_eval_on_{max_slice}'
+    if 'ensemble_model' in results_prompt and latest_ensemble_key in results_prompt['ensemble_model']:
+        latest_ensemble_ndcg = results_prompt['ensemble_model'][latest_ensemble_key]['ndcg']
+    else:
+        print(f"Warning: Ensemble model results not found for the latest slice, using prompt model results")
+        latest_ensemble_ndcg = results_prompt['prompt_model'][latest_ensemble_key]['ndcg']
+    
     latest_base_ndcg = results_incremental['base_model'][f'slice_{max_slice}']['ndcg']
     
     comparison_table += f"\n=== New Knowledge Acquisition (T{max_slice+1} Performance) ===\n"
     comparison_table += f"Incremental Model NDCG: {latest_inc_ndcg:.4f}\n"
-    comparison_table += f"Prompt Model NDCG: {latest_prompt_ndcg:.4f}\n"
-    comparison_table += f"Improvement: {latest_prompt_ndcg - latest_inc_ndcg:+.4f}\n"
+    comparison_table += f"Ensemble Model NDCG: {latest_ensemble_ndcg:.4f}\n"
+    comparison_table += f"Improvement: {latest_ensemble_ndcg - latest_inc_ndcg:+.4f}\n"
     
     # Print and log comparison table
     print(comparison_table)
@@ -1019,9 +1103,13 @@ def compare_results(results_incremental, results_prompt, args, output_dir, log_f
     # Combine results for easy reference
     combined_results = {
         'base_model': results_incremental['base_model'],
-        'incremental_model': results_incremental['incremental_model'],
-        'prompt_model': results_prompt['prompt_model']
+        'incremental_model': results_incremental['incremental_model']
     }
+    # Add ensemble model results
+    if 'ensemble_model' in results_prompt:
+        combined_results['ensemble_model'] = results_prompt['ensemble_model']
+    else:
+        combined_results['ensemble_model'] = results_prompt['prompt_model']
     
     with open(os.path.join(output_dir, 'combined_results.pkl'), 'wb') as f:
         pickle.dump(combined_results, f)
@@ -1084,14 +1172,27 @@ def generate_detailed_comparison(results_incremental, results_prompt, args, outp
         # Add rows for each test slice
         for test_slice in range(args.num_slices):
             # For slice 0 (base model), handle differently
+            # if train_slice == 0:
+            #     # Use base model results for the first slice
+            #     base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
+            #     base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
+            #     # For ensemble, use base model result for all slices in the first iteration
+            #     ensemble_ndcg = base_ndcg  # Use base model values for ensemble
+            #     ensemble_hr = base_hr      # Use base model values for ensemble
             if train_slice == 0:
-                # Use base model results for the first slice
+                # 基础模型结果
                 base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
                 base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
-                # For ensemble, use base model result for all slices in the first iteration
-                ensemble_ndcg = base_ndcg  # Use base model values for ensemble
-                ensemble_hr = base_hr      # Use base model values for ensemble
                 
+                # 提示模型结果 - 这是关键修改
+                if 'prompt_model' in results_prompt and f'slice_{test_slice}' in results_prompt['prompt_model']:
+                    ensemble_ndcg = results_prompt['prompt_model'][f'slice_{test_slice}']['ndcg']
+                    ensemble_hr = results_prompt['prompt_model'][f'slice_{test_slice}']['hr']
+                else:
+                    print(f"警告: 未找到提示模型在切片 {test_slice} 的结果，使用基础模型结果代替")
+                    ensemble_ndcg = base_ndcg
+                    ensemble_hr = base_hr
+
                 comparison_table += f"T{test_slice}\t{base_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{base_hr:.4f}\t{ensemble_hr:.4f}\n"
                 
             else:
