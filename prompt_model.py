@@ -54,9 +54,8 @@ class PromptBaseSASRec(SASRec):
         prompt_dim = args.item_hidden_units # + args.user_hidden_units
         self.num_prompts = getattr(args, 'num_prompts', 8)
         
-        # Create prompt bank
-        self.prompt_bank = PromptBank(prompt_dim, self.num_prompts)#, initial_prompts)
-        
+        # Create enhanced prompt bank
+        self.prompt_bank = EnhancedPromptBank(prompt_dim, self.num_prompts)         
         # For tracking which prompts should be frozen
         self.frozen_prompt_indices = []
         
@@ -224,6 +223,113 @@ class PromptBaseSASRec(SASRec):
             loss += distill_alpha * distill_loss
         
         return loss, attention_weights, auc, l2_loss
+    
+
+    def get_prompt_selections(self, u, seq):
+        """Extract prompt selection weights for a given sequence"""
+        with torch.no_grad():
+            # Get mask for valid items
+            mask = (seq > 0)
+            batch_size = seq.size(0)
+            
+            # Get embeddings
+            seq_emb = self.item_emb(seq)
+            
+            # Position encoding
+            pos_ids = torch.arange(seq.size(1), dtype=torch.long).to(self.dev)
+            pos_ids = pos_ids.unsqueeze(0).expand_as(seq)
+            pos_emb = self.pos_emb(pos_ids)
+            
+            # Combine embeddings
+            seq_repr = seq_emb + pos_emb
+            
+            # Get a summary of user's sequence for prompt selection
+            valid_positions = mask.sum(dim=1) - 1  # Get index of last valid position
+            valid_positions = torch.clamp(valid_positions, min=0)  # Ensure non-negative
+            
+            batch_indices = torch.arange(batch_size, device=self.dev)
+            query_vectors = seq_repr[batch_indices, valid_positions]
+            
+            # Calculate similarity between query and prompts
+            similarities = torch.matmul(query_vectors, self.prompt_bank.prompts.T) / self.prompt_bank.temperature
+            
+            # Apply softmax to get attention weights
+            prompt_weights = F.softmax(similarities, dim=-1)
+            
+            return prompt_weights
+        
+
+
+    def prompt_aware_distillation(self, train_data, old_data, args, device):
+        """Fine-tune with distillation that preserves prompt behavior"""
+        print("=== Performing Prompt-Aware Distillation ===")
+        
+        # Create a copy of the current model (with its prompt bank)
+        previous_model = copy.deepcopy(self)
+        previous_model.eval()
+        
+        # Create optimizer with low learning rate for fine-tuning
+        optimizer = torch.optim.Adam(self.parameters(), lr=args.lr * 0.01)
+        
+        # Create sampler for old data
+        old_sampler = WarpSampler(old_data, self.usernum, self.itemnum,
+                            batch_size=args.batch_size, maxlen=args.maxlen,
+                            threshold_user=args.threshold_user,
+                            threshold_item=args.threshold_item,
+                            n_workers=1, device=device)
+        
+        # Fine-tune with distillation
+        num_batches = max(len(old_data) // args.batch_size * 2, 50)  # Process old data multiple times
+        
+        for i in range(num_batches):
+            # Get batch from old data
+            u, seq, pos, neg = old_sampler.next_batch()
+            
+            # Skip if batch is empty
+            if u.size(0) == 0:
+                continue
+            
+            # Get selections from previous model
+            with torch.no_grad():
+                # Get which prompts the old model would select
+                old_prompt_selections = previous_model.get_prompt_selections(u, seq)
+                
+                # Get predictions for a sample of items (using neg items as a sample)
+                sample_items = torch.unique(neg)
+                if len(sample_items) > 10:  # Ensure we have enough items
+                    old_predictions = previous_model.predict(u, seq, sample_items)
+            
+            # Forward pass in current model
+            current_prompt_selections = self.get_prompt_selections(u, seq)
+            current_predictions = self.predict(u, seq, sample_items)
+            
+            # Regular loss for current task
+            loss, _, _, _ = self(u, seq, pos, neg, is_training=True)
+            
+            # Distillation loss on predictions
+            pred_distill_loss = F.kl_div(
+                F.log_softmax(current_predictions / 2.0, dim=-1),
+                F.softmax(old_predictions / 2.0, dim=-1),
+                reduction='batchmean'
+            )
+            
+            # Prompt selection distillation loss
+            prompt_distill_loss = F.mse_loss(current_prompt_selections, old_prompt_selections)
+            
+            # Combined loss with emphasis on prompt behavior
+            combined_loss = 0.4 * loss + 0.3 * pred_distill_loss + 0.3 * prompt_distill_loss
+            
+            optimizer.zero_grad()
+            combined_loss.backward()
+            optimizer.step()
+            
+            if i % 20 == 0:
+                print(f"Distillation batch {i}/{num_batches}: Loss={combined_loss.item():.4f}")
+        
+        # Close the sampler
+        old_sampler.close()
+        
+        print("=== Prompt-Aware Distillation Completed ===")
 
     def predict(self, u, seq, item_idx):
         """
@@ -997,3 +1103,45 @@ class EnhancedEnsemblePromptSASRec(nn.Module):
         For training, only update incremental model
         """
         return self.incremental_model(u, seq, pos, neg, is_training=is_training)
+    
+
+class EnhancedPromptBank(nn.Module):
+    """Enhanced prompt bank with memory mechanisms"""
+    def __init__(self, prompt_dim, num_prompts=8):
+        super(EnhancedPromptBank, self).__init__()
+        # Initialize learnable prompt vectors
+        self.prompts = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        
+        # Tracking prompt usage statistics
+        self.register_buffer('usage_counts', torch.zeros(num_prompts))
+        self.register_buffer('importance_scores', torch.ones(num_prompts))
+        
+    def update_importance(self, weights_batch):
+        """Update importance scores based on usage in this batch"""
+        batch_usage = weights_batch.sum(dim=0)
+        self.usage_counts += batch_usage
+        
+        # Calculate importance based on usage frequency
+        if self.usage_counts.sum() > 0:
+            self.importance_scores = self.usage_counts / self.usage_counts.sum()
+        
+    def forward(self, query_embedding, top_k=10):
+        """Select relevant prompts based on query embedding"""
+        # Calculate similarity between query and prompts
+        similarity = torch.matmul(query_embedding, self.prompts.T) / self.temperature
+        
+        # Get top-k indices and scores
+        top_k_values, top_k_indices = torch.topk(similarity, k=min(top_k, similarity.size(-1)), dim=-1)
+        
+        # Create a sparse attention weights tensor
+        attention = torch.zeros_like(similarity).scatter_(-1, top_k_indices, F.softmax(top_k_values, dim=-1))
+        
+        # Update importance scores if we're in training mode
+        if self.training:
+            self.update_importance(attention)
+        
+        # Get weighted combination of prompts
+        selected_prompts = torch.matmul(attention, self.prompts)
+        
+        return selected_prompts, attention, top_k_indices

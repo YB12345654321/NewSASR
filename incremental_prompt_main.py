@@ -544,9 +544,10 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
 
         # Update this section in run_prompt_incremental_learning function
         # Determine number of epochs for each phase with optimized distribution
-        inc_epochs_total = args.num_epochs // 1  # Fewer epochs for incremental learning
-        phase1_epochs = int(inc_epochs_total * 0.3)  # 30% for Phase 1
-        phase2_epochs = int(inc_epochs_total * 0.5)  # 50% for Phase 2
+        # Determine number of epochs for each phase with optimized distribution
+        inc_epochs_total = args.num_epochs // 2  # Fewer epochs for incremental learning
+        phase1_epochs = int(inc_epochs_total * 0.2)  # Reduce Phase 1 (from 0.3)
+        phase2_epochs = int(inc_epochs_total * 0.6)  # Increase Phase 2 (from 0.5)
         phase3_epochs = inc_epochs_total - phase1_epochs - phase2_epochs  # Remaining for Phase 3
 
         print(f"Phase distribution: Phase 1 = {phase1_epochs} epochs, Phase 2 = {phase2_epochs} epochs, Phase 3 = {phase3_epochs} epochs")
@@ -873,6 +874,16 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
                     print(f"[Slice {slice_idx}, Phase 3, epoch {epoch}] No valid test users found. Skipping.")
                 
                 t0 = time.time()
+        # Apply prompt-aware distillation to preserve knowledge
+        print("\n=== Applying Prompt-Aware Distillation to Preserve Knowledge ===")
+        # Get data from previous slice(s) for distillation
+        old_slice_data = {}
+        for prev_slice in range(max(0, slice_idx-1)):  # Use up to 2 previous slices
+            prev_data = time_data.prepare_slice(prev_slice, include_previous=False)[0]  # Get train data
+            old_slice_data.update(prev_data)
+
+        if old_slice_data:
+            prompt_model.prompt_aware_distillation(slice_user_train, old_slice_data, args, device)
         
         # Close sampler
         slice_sampler.close()
@@ -926,7 +937,7 @@ def run_prompt_incremental_learning(args, time_data, base_model, t1_items, outpu
     return results
 
 
-def compare_results(results_incremental, results_prompt, args, output_dir, log_file):
+def compare_results(results_incremental, results_prompt, args, time_data, output_dir, log_file):
     """
     Compare results from incremental model and ensemble model
     
@@ -1118,6 +1129,133 @@ def compare_results(results_incremental, results_prompt, args, output_dir, log_f
 
     generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file)
 
+    # Add this at the bottom of the compare_results function
+    # Add this at the bottom of the compare_results function
+    print("\n=== Testing Prompt Effectiveness ===")
+    # Test the standalone prompt model on an earlier slice to measure knowledge retention
+    early_slice = 0  # Test on the first slice
+
+    # We need to prepare the data using time_data passed to the function
+    # Get the time_data object from the arguments
+    from incremental_data import TimeSlicedData
+    test_data = time_data.prepare_slice(early_slice, include_previous=False)
+
+    # Get the device from args
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # Load the final prompt model
+    final_prompt_model_path = os.path.join(output_dir, f'prompt_model_slice_{max_slice}.pt')
+    if os.path.exists(final_prompt_model_path):
+        prompt_model = torch.load(final_prompt_model_path)
+        
+        if check_dataset_validity(test_data):
+            prompt_ndcg, prompt_hr = evaluate(prompt_model, test_data, args, device)
+            base_ndcg = results_incremental['base_model'][f'slice_{early_slice}']['ndcg']
+            print(f"Original base model on slice {early_slice}: NDCG={base_ndcg:.4f}")
+            print(f"Final prompt model on slice {early_slice}: NDCG={prompt_ndcg:.4f}")
+            retention_rate = prompt_ndcg / base_ndcg if base_ndcg > 0 else 0
+            print(f"Prompt knowledge retention rate: {retention_rate:.2%}")
+        else:
+            print(f"Cannot evaluate - no valid test users found in slice {early_slice}")
+    else:
+        print(f"Cannot test - prompt model file not found at {final_prompt_model_path}")
+
+# def run_comparison(args):
+#     """
+#     Run both incremental and prompt-based models and compare results
+#     """
+#     # Set random seed for reproducibility
+#     set_seed(args.seed)
+    
+#     # Create output directory
+#     output_dir = args.dataset + '_' + args.train_dir + '_comparison'
+#     if not os.path.isdir(output_dir):
+#         os.makedirs(output_dir)
+    
+#     # Log file
+#     log_file = open(os.path.join(output_dir, 'comparison_log.txt'), 'w')
+#     log_file.write(f"Random seed: {args.seed}\n")
+    
+#     # Load time sliced data
+#     time_data, time_slices = prepare_time_sliced_data(args, output_dir)
+    
+#     # Run incremental learning
+#     print("\n=== Running Standard Incremental Learning ===")
+#     results_incremental, base_model, t1_items = run_incremental_learning(args, time_data, output_dir, log_file)
+    
+#     # Run prompt-based incremental learning with three-phase approach
+#     print("\n=== Running Prompt-Based Incremental Learning with Three-Phase Approach ===")
+#     results_prompt = run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file)
+    
+#     # Find where compare_results is called in run_comparison function
+#     compare_results(results_incremental, results_prompt, args, time_data, output_dir, log_file)
+    
+#     # Close log file
+#     log_file.close()
+    
+#     print("\n=== Comparison Completed ===")
+#     print(f"Results saved to {output_dir}")
+
+
+# def generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file):
+#     """
+#     Generate a simplified comparison of model performance after each training slice
+#     """
+#     print("\n=== Detailed Slice-by-Slice Comparison ===")
+#     log_file.write("\n=== Detailed Slice-by-Slice Comparison ===\n")
+    
+#     # For each training slice (starting from 0)
+#     for train_slice in range(args.num_slices):
+#         # Create table header
+#         comparison_table = f"\n=== After Training on Slice {train_slice} (T{train_slice+1}) ===\n"
+#         comparison_table += "Test Slice\tIncremental NDCG\tEnsemble NDCG\tIncremental HR\tEnsemble HR\n"
+        
+#         # Add rows for each test slice
+#         for test_slice in range(args.num_slices):
+#             # For slice 0 (base model), handle differently
+#             # if train_slice == 0:
+#             #     # Use base model results for the first slice
+#             #     base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
+#             #     base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
+#             #     # For ensemble, use base model result for all slices in the first iteration
+#             #     ensemble_ndcg = base_ndcg  # Use base model values for ensemble
+#             #     ensemble_hr = base_hr      # Use base model values for ensemble
+#             if train_slice == 0:
+#                 # 基础模型结果
+#                 base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
+#                 base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
+                
+#                 # 提示模型结果 - 这是关键修改
+#                 if 'prompt_model' in results_prompt and f'slice_{test_slice}' in results_prompt['prompt_model']:
+#                     ensemble_ndcg = results_prompt['prompt_model'][f'slice_{test_slice}']['ndcg']
+#                     ensemble_hr = results_prompt['prompt_model'][f'slice_{test_slice}']['hr']
+#                 else:
+#                     print(f"警告: 未找到提示模型在切片 {test_slice} 的结果，使用基础模型结果代替")
+#                     ensemble_ndcg = base_ndcg
+#                     ensemble_hr = base_hr
+
+#                 comparison_table += f"T{test_slice}\t{base_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{base_hr:.4f}\t{ensemble_hr:.4f}\n"
+                
+#             else:
+#                 # Get results for incremental model
+#                 inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
+#                 inc_hr = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
+                
+#                 # Get results for ensemble model
+#                 ensemble_ndcg = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
+#                 ensemble_hr = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
+                
+#                 comparison_table += f"T{test_slice}\t{inc_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{inc_hr:.4f}\t{ensemble_hr:.4f}\n"
+        
+#         # Print and log
+#         print(comparison_table)
+#         log_file.write(comparison_table)
+        
+#         # Save to individual file
+#         with open(os.path.join(output_dir, f'comparison_after_slice_{train_slice}.txt'), 'w') as f:
+#             f.write(comparison_table)
+
+            
 
 def run_comparison(args):
     """
@@ -1147,7 +1285,10 @@ def run_comparison(args):
     results_prompt = run_prompt_incremental_learning(args, time_data, base_model, t1_items, output_dir, log_file)
     
     # Compare results
-    compare_results(results_incremental, results_prompt, args, output_dir, log_file)
+    compare_results(results_incremental, results_prompt, args, time_data, output_dir, log_file)
+    
+    # Generate detailed slice-by-slice comparison with prompt model performance
+    generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file)
     
     # Close log file
     log_file.close()
@@ -1156,55 +1297,74 @@ def run_comparison(args):
     print(f"Results saved to {output_dir}")
 
 
+
 def generate_detailed_comparison(results_incremental, results_prompt, args, output_dir, log_file):
     """
-    Generate a simplified comparison of model performance after each training slice
+    Generate a detailed comparison of model performance after each training slice
+    including prompt model performance
     """
     print("\n=== Detailed Slice-by-Slice Comparison ===")
     log_file.write("\n=== Detailed Slice-by-Slice Comparison ===\n")
     
     # For each training slice (starting from 0)
     for train_slice in range(args.num_slices):
-        # Create table header
+        # Create table header with proper spacing
         comparison_table = f"\n=== After Training on Slice {train_slice} (T{train_slice+1}) ===\n"
-        comparison_table += "Test Slice\tIncremental NDCG\tEnsemble NDCG\tIncremental HR\tEnsemble HR\n"
+        comparison_table += "Test Slice\tIncremental NDCG\tPrompt NDCG\tEnsemble NDCG\tIncremental HR\tPrompt HR\tEnsemble HR\n"
         
         # Add rows for each test slice
         for test_slice in range(args.num_slices):
-            # For slice 0 (base model), handle differently
-            # if train_slice == 0:
-            #     # Use base model results for the first slice
-            #     base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
-            #     base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
-            #     # For ensemble, use base model result for all slices in the first iteration
-            #     ensemble_ndcg = base_ndcg  # Use base model values for ensemble
-            #     ensemble_hr = base_hr      # Use base model values for ensemble
+            # Base case (slice 0)
             if train_slice == 0:
-                # 基础模型结果
+                # These are all the same for slice 0 since it's the initial training
                 base_ndcg = results_incremental['base_model'][f'slice_{test_slice}']['ndcg']
                 base_hr = results_incremental['base_model'][f'slice_{test_slice}']['hr']
                 
-                # 提示模型结果 - 这是关键修改
+                # For the prompt model in slice 0
                 if 'prompt_model' in results_prompt and f'slice_{test_slice}' in results_prompt['prompt_model']:
-                    ensemble_ndcg = results_prompt['prompt_model'][f'slice_{test_slice}']['ndcg']
-                    ensemble_hr = results_prompt['prompt_model'][f'slice_{test_slice}']['hr']
+                    prompt_ndcg = results_prompt['prompt_model'][f'slice_{test_slice}']['ndcg']
+                    prompt_hr = results_prompt['prompt_model'][f'slice_{test_slice}']['hr']
                 else:
-                    print(f"警告: 未找到提示模型在切片 {test_slice} 的结果，使用基础模型结果代替")
-                    ensemble_ndcg = base_ndcg
-                    ensemble_hr = base_hr
-
-                comparison_table += f"T{test_slice}\t{base_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{base_hr:.4f}\t{ensemble_hr:.4f}\n"
+                    prompt_ndcg = 0.0
+                    prompt_hr = 0.0
                 
+                # For ensemble in slice 0
+                ensemble_ndcg = prompt_ndcg  # Same as prompt in first slice
+                ensemble_hr = prompt_hr
+                
+                comparison_table += f"T{test_slice}\t{base_ndcg:.4f}\t{prompt_ndcg:.4f}\t{ensemble_ndcg:.4f}\t"
+                comparison_table += f"{base_hr:.4f}\t{prompt_hr:.4f}\t{ensemble_hr:.4f}\n"
             else:
-                # Get results for incremental model
-                inc_ndcg = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
-                inc_hr = results_incremental['incremental_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if f'after_slice_{train_slice}_eval_on_{test_slice}' in results_incremental['incremental_model'] else 0.0
+                # For incremental slices
+                inc_key = f'after_slice_{train_slice}_eval_on_{test_slice}'
                 
-                # Get results for ensemble model
-                ensemble_ndcg = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['ndcg'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
-                ensemble_hr = results_prompt['ensemble_model'][f'after_slice_{train_slice}_eval_on_{test_slice}']['hr'] if 'ensemble_model' in results_prompt and f'after_slice_{train_slice}_eval_on_{test_slice}' in results_prompt['ensemble_model'] else 0.0
+                # Incremental model
+                if inc_key in results_incremental['incremental_model']:
+                    inc_ndcg = results_incremental['incremental_model'][inc_key]['ndcg']
+                    inc_hr = results_incremental['incremental_model'][inc_key]['hr']
+                else:
+                    inc_ndcg = 0.0
+                    inc_hr = 0.0
                 
-                comparison_table += f"T{test_slice}\t{inc_ndcg:.4f}\t{ensemble_ndcg:.4f}\t{inc_hr:.4f}\t{ensemble_hr:.4f}\n"
+                # Prompt model
+                if 'prompt_model' in results_prompt and inc_key in results_prompt['prompt_model']:
+                    prompt_ndcg = results_prompt['prompt_model'][inc_key]['ndcg']
+                    prompt_hr = results_prompt['prompt_model'][inc_key]['hr']
+                else:
+                    prompt_ndcg = 0.0
+                    prompt_hr = 0.0
+                
+                # Ensemble model
+                if 'ensemble_model' in results_prompt and inc_key in results_prompt['ensemble_model']:
+                    ensemble_ndcg = results_prompt['ensemble_model'][inc_key]['ndcg']
+                    ensemble_hr = results_prompt['ensemble_model'][inc_key]['hr']
+                else:
+                    ensemble_ndcg = 0.0
+                    ensemble_hr = 0.0
+                
+                # Format string with proper spacing
+                comparison_table += f"T{test_slice}\t{inc_ndcg:.4f}\t{prompt_ndcg:.4f}\t{ensemble_ndcg:.4f}\t"
+                comparison_table += f"{inc_hr:.4f}\t{prompt_hr:.4f}\t{ensemble_hr:.4f}\n"
         
         # Print and log
         print(comparison_table)
